@@ -96,6 +96,7 @@ from app.schemas import (
     TankStockLedgerResponse,
     TankStockLedgerSummaryResponse,
     TankStockLedgerDailySummaryResponse,
+    OutTurnReportResponse,
     PermissionCreate,
     PermissionResponse,
     RoleCreate,
@@ -1716,6 +1717,11 @@ def seed_standard_permissions(
             "permission_name": "Manage Admin Settings",
             "module_name": "Admin",
             "description": "Can manage admin settings",
+        },
+        {
+            "permission_name": "View Out-Turn Report",
+            "module_name": "Reports",
+            "description": "Can view Out-Turn Report from approved tank stock ledger rows",
         },
     ]
 
@@ -5407,6 +5413,233 @@ def get_tank_stock_rows_for_daily_summary(
     )
 
 
+def get_stock_snapshot_values(row: TankStockLedger):
+    stock_gsv = safe_float(row.stock_gsv_bbl)
+    stock_nsv = safe_float(row.stock_nsv_bbl)
+    stock_lt = safe_float(row.stock_lt)
+    stock_mt = safe_float(row.stock_mt)
+
+    # Backward compatibility for old rows created before stock_* existed.
+    if stock_gsv == 0 and stock_nsv == 0:
+        stock_gsv = safe_float(row.running_balance_gsv_bbl)
+        stock_nsv = safe_float(row.running_balance_nsv_bbl)
+        stock_lt = safe_float(row.running_balance_lt)
+        stock_mt = safe_float(row.running_balance_mt)
+
+    return {
+        "gsv": stock_gsv,
+        "nsv": stock_nsv,
+        "lt": stock_lt,
+        "mt": stock_mt,
+    }
+
+# -------------------------
+# Out-Turn Report Helpers
+# -------------------------
+
+def get_ledger_operation_datetime(row: TankStockLedger):
+    try:
+        payload = row.source_payload or {}
+        inputs = payload.get("inputs") or {}
+
+        gauging_date = clean_optional_text(inputs.get("gaugingDate"))
+        gauging_time = clean_optional_text(inputs.get("gaugingTime"))
+
+        if gauging_date and gauging_time:
+            return datetime.fromisoformat(f"{gauging_date}T{gauging_time}")
+    except Exception:
+        pass
+
+    if row.accounting_day_start is not None:
+        return row.accounting_day_start
+
+    if row.operation_date is not None:
+        return datetime.combine(row.operation_date, datetime_time(0, 0))
+
+    return None
+
+
+def build_out_turn_report_response(
+    row: TankStockLedger,
+    db: Session,
+):
+    location = get_location_by_code(row.location_code, db)
+
+    operation_datetime = get_ledger_operation_datetime(row)
+
+    previous_gsv = safe_float(row.previous_stock_gsv_bbl)
+    previous_nsv = safe_float(row.previous_stock_nsv_bbl)
+    previous_lt = safe_float(row.previous_stock_lt)
+    previous_mt = safe_float(row.previous_stock_mt)
+
+    stock_snapshot = get_stock_snapshot_values(row)
+
+    stock_after_gsv = stock_snapshot["gsv"]
+    stock_after_nsv = stock_snapshot["nsv"]
+    stock_after_lt = stock_snapshot["lt"]
+    stock_after_mt = stock_snapshot["mt"]
+
+    movement_gsv = safe_float(row.movement_gsv_bbl)
+    movement_nsv = safe_float(row.movement_nsv_bbl)
+    movement_lt = safe_float(row.movement_lt)
+    movement_mt = safe_float(row.movement_mt)
+
+    sign = str(row.tank_operation_sign or "").upper()
+
+    net_receipt_gsv = 0
+    net_receipt_nsv = 0
+    net_receipt_lt = 0
+    net_receipt_mt = 0
+
+    net_dispatch_gsv = 0
+    net_dispatch_nsv = 0
+    net_dispatch_lt = 0
+    net_dispatch_mt = 0
+
+    signed_net_gsv = 0
+    signed_net_nsv = 0
+    signed_net_lt = 0
+    signed_net_mt = 0
+
+    if sign == "IN":
+        net_receipt_gsv = movement_gsv
+        net_receipt_nsv = movement_nsv
+        net_receipt_lt = movement_lt
+        net_receipt_mt = movement_mt
+
+        signed_net_gsv = movement_gsv
+        signed_net_nsv = movement_nsv
+        signed_net_lt = movement_lt
+        signed_net_mt = movement_mt
+
+    elif sign == "OUT":
+        net_dispatch_gsv = movement_gsv
+        net_dispatch_nsv = movement_nsv
+        net_dispatch_lt = movement_lt
+        net_dispatch_mt = movement_mt
+
+        signed_net_gsv = movement_gsv * -1
+        signed_net_nsv = movement_nsv * -1
+        signed_net_lt = movement_lt * -1
+        signed_net_mt = movement_mt * -1
+
+    elif sign == "SET":
+        # SET rows are stock declaration rows, not receipt/dispatch movement rows.
+        signed_net_gsv = 0
+        signed_net_nsv = 0
+        signed_net_lt = 0
+        signed_net_mt = 0
+
+    elif sign == "NEUTRAL":
+        signed_net_gsv = 0
+        signed_net_nsv = 0
+        signed_net_lt = 0
+        signed_net_mt = 0
+
+    return {
+        "ledger_id": row.id,
+        "transaction_id": row.transaction_id,
+        "ticket_number": row.ticket_number,
+        "operation_number": row.operation_number,
+        "accounting_date": row.accounting_date,
+        "operation_datetime": operation_datetime,
+        "location_code": row.location_code,
+        "location_name": location.location_name if location else "",
+        "tank_asset_code": row.tank_asset_code,
+        "tank_asset_name": row.tank_asset_name,
+        "product_name": row.product_name,
+        "tank_operation_code": row.tank_operation_code,
+        "tank_operation_label": row.tank_operation_label,
+        "tank_operation_category": row.tank_operation_category,
+        "tank_operation_sign": row.tank_operation_sign,
+        "previous_stock_gsv_bbl": round(previous_gsv, 3),
+        "previous_stock_nsv_bbl": round(previous_nsv, 3),
+        "previous_stock_lt": round(previous_lt, 3),
+        "previous_stock_mt": round(previous_mt, 3),
+        "stock_after_gsv_bbl": round(stock_after_gsv, 3),
+        "stock_after_nsv_bbl": round(stock_after_nsv, 3),
+        "stock_after_lt": round(stock_after_lt, 3),
+        "stock_after_mt": round(stock_after_mt, 3),
+        "net_receipt_gsv_bbl": round(net_receipt_gsv, 3),
+        "net_receipt_nsv_bbl": round(net_receipt_nsv, 3),
+        "net_receipt_lt": round(net_receipt_lt, 3),
+        "net_receipt_mt": round(net_receipt_mt, 3),
+        "net_dispatch_gsv_bbl": round(net_dispatch_gsv, 3),
+        "net_dispatch_nsv_bbl": round(net_dispatch_nsv, 3),
+        "net_dispatch_lt": round(net_dispatch_lt, 3),
+        "net_dispatch_mt": round(net_dispatch_mt, 3),
+        "signed_net_movement_gsv_bbl": round(signed_net_gsv, 3),
+        "signed_net_movement_nsv_bbl": round(signed_net_nsv, 3),
+        "signed_net_movement_lt": round(signed_net_lt, 3),
+        "signed_net_movement_mt": round(signed_net_mt, 3),
+        "status": row.status,
+        "remarks": row.remarks,
+    }
+
+
+def get_out_turn_report_rows(
+    db: Session,
+    location_code: str | None = None,
+    tank_asset_code: str | None = None,
+    product_name: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status: str | None = "Active",
+):
+    query = db.query(TankStockLedger)
+
+    cleaned_location_code = clean_optional_text(location_code)
+    cleaned_tank_asset_code = clean_optional_text(tank_asset_code)
+    cleaned_product_name = clean_optional_text(product_name)
+    cleaned_status = clean_optional_text(status)
+
+    if cleaned_status:
+        query = query.filter(TankStockLedger.status == cleaned_status)
+
+    if cleaned_location_code:
+        query = query.filter(
+            TankStockLedger.location_code.ilike(cleaned_location_code)
+        )
+
+    if cleaned_tank_asset_code:
+        query = query.filter(
+            TankStockLedger.tank_asset_code.ilike(cleaned_tank_asset_code)
+        )
+
+    if cleaned_product_name:
+        query = query.filter(
+            TankStockLedger.product_name.ilike(cleaned_product_name)
+        )
+
+    date_from_value = parse_date_filter(date_from, "Date From")
+    date_to_value = parse_date_filter(date_to, "Date To")
+
+    if date_from_value:
+        query = query.filter(TankStockLedger.accounting_date >= date_from_value)
+
+    if date_to_value:
+        query = query.filter(TankStockLedger.accounting_date <= date_to_value)
+
+    rows = query.all()
+
+    # Display order is global chronological order.
+    # Net movement itself must NOT depend on this display order.
+    # Net movement comes from ledger.previous_stock_* and movement_*,
+    # which are calculated per location + tank + product group.
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            row.accounting_date or date.min,
+            get_ledger_operation_datetime(row) or datetime.min,
+            row.location_code or "",
+            row.tank_asset_code or "",
+            row.product_name or "",
+            row.id,
+        ),
+    )
+
+    return rows
+
 def build_tank_stock_daily_summary_rows(
     db: Session,
     ledger_rows: list[TankStockLedger],
@@ -5436,9 +5669,19 @@ def build_tank_stock_daily_summary_rows(
 
         location = get_location_by_code(location_code, db)
 
+        sorted_rows = sorted(
+            rows,
+            key=lambda row: (
+                row.accounting_date or date.min,
+                row.accounting_day_start or datetime.min,
+                row.operation_date or date.min,
+                row.id,
+            ),
+        )
+
         tank_asset_name = ""
-        if rows:
-            tank_asset_name = rows[-1].tank_asset_name or ""
+        if sorted_rows:
+            tank_asset_name = sorted_rows[-1].tank_asset_name or ""
 
         previous_closing_gsv = 0
         previous_closing_nsv = 0
@@ -5447,55 +5690,56 @@ def build_tank_stock_daily_summary_rows(
 
         rows_before_period = [
             row
-            for row in rows
+            for row in sorted_rows
             if row.accounting_date is not None
             and row.accounting_date < date_from_value
         ]
 
         if rows_before_period:
             last_before_period = rows_before_period[-1]
-            previous_closing_gsv = safe_float(
-                last_before_period.running_balance_gsv_bbl
-            )
-            previous_closing_nsv = safe_float(
-                last_before_period.running_balance_nsv_bbl
-            )
-            previous_closing_lt = safe_float(
-                last_before_period.running_balance_lt
-            )
-            previous_closing_mt = safe_float(
-                last_before_period.running_balance_mt
-            )
+            previous_snapshot = get_stock_snapshot_values(last_before_period)
+
+            previous_closing_gsv = previous_snapshot["gsv"]
+            previous_closing_nsv = previous_snapshot["nsv"]
+            previous_closing_lt = previous_snapshot["lt"]
+            previous_closing_mt = previous_snapshot["mt"]
 
         for accounting_date_value in date_range:
             day_rows = [
                 row
-                for row in rows
+                for row in sorted_rows
                 if row.accounting_date == accounting_date_value
             ]
 
+            day_rows = sorted(
+                day_rows,
+                key=lambda row: (
+                    row.accounting_day_start or datetime.min,
+                    row.operation_date or date.min,
+                    row.id,
+                ),
+            )
+
+            # Default opening is previous accounting day's actual closing.
             opening_gsv = previous_closing_gsv
             opening_nsv = previous_closing_nsv
             opening_lt = previous_closing_lt
             opening_mt = previous_closing_mt
 
-            opening_set_rows = [
+            # If user entered an explicit Opening Stock, use its stock snapshot as opening.
+            opening_rows = [
                 row
                 for row in day_rows
                 if str(row.tank_operation_category or "").upper() == "OPENING"
-                or (
-                    str(row.tank_operation_sign or "").upper() == "SET"
-                    and str(row.tank_operation_category or "").upper()
-                    == "OPENING"
-                )
             ]
 
-            if opening_set_rows:
-                opening_row = opening_set_rows[-1]
-                opening_gsv = safe_float(opening_row.movement_gsv_bbl)
-                opening_nsv = safe_float(opening_row.movement_nsv_bbl)
-                opening_lt = safe_float(opening_row.movement_lt)
-                opening_mt = safe_float(opening_row.movement_mt)
+            if opening_rows:
+                opening_snapshot = get_stock_snapshot_values(opening_rows[-1])
+
+                opening_gsv = opening_snapshot["gsv"]
+                opening_nsv = opening_snapshot["nsv"]
+                opening_lt = opening_snapshot["lt"]
+                opening_mt = opening_snapshot["mt"]
 
             total_in_gsv = 0
             total_in_nsv = 0
@@ -5535,24 +5779,32 @@ def build_tank_stock_daily_summary_rows(
             last_ticket_number = None
 
             if day_rows:
-                last_row_of_day = day_rows[-1]
+                # Correct rule:
+                # Closing stock is the latest stock snapshot in the accounting day.
+                # User does not need to create an explicit Closing Stock ticket.
+                closing_rows = [
+                    row
+                    for row in day_rows
+                    if str(row.tank_operation_category or "").upper()
+                    == "CLOSING"
+                ]
 
-                actual_closing_gsv = safe_float(
-                    last_row_of_day.running_balance_gsv_bbl
-                )
-                actual_closing_nsv = safe_float(
-                    last_row_of_day.running_balance_nsv_bbl
-                )
-                actual_closing_lt = safe_float(
-                    last_row_of_day.running_balance_lt
-                )
-                actual_closing_mt = safe_float(
-                    last_row_of_day.running_balance_mt
-                )
-                last_ticket_number = last_row_of_day.ticket_number
+                if closing_rows:
+                    closing_source_row = closing_rows[-1]
+                else:
+                    closing_source_row = day_rows[-1]
 
-            # If no row exists for this accounting day, carry forward previous closing.
-            if not day_rows:
+                closing_snapshot = get_stock_snapshot_values(closing_source_row)
+
+                actual_closing_gsv = closing_snapshot["gsv"]
+                actual_closing_nsv = closing_snapshot["nsv"]
+                actual_closing_lt = closing_snapshot["lt"]
+                actual_closing_mt = closing_snapshot["mt"]
+                last_ticket_number = closing_source_row.ticket_number
+
+            else:
+                # No entry on this accounting day:
+                # carry forward previous day closing.
                 actual_closing_gsv = opening_gsv
                 actual_closing_nsv = opening_nsv
                 actual_closing_lt = opening_lt
@@ -5619,7 +5871,6 @@ def build_tank_stock_daily_summary_rows(
             row["product_name"] or "",
         ),
     )
-
 
 @app.get(
     "/tank-stock-ledger",
@@ -5792,6 +6043,159 @@ def get_tank_stock_ledger_daily_summary(
         date_from_value=date_from_value,
         date_to_value=date_to_value,
     )
+
+@app.get(
+    "/out-turn-report",
+    response_model=list[OutTurnReportResponse],
+)
+def get_out_turn_report(
+    location_code: str | None = None,
+    tank_asset_code: str | None = None,
+    product_name: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status: str | None = "Active",
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Out-Turn Report",
+        db,
+    )
+
+    rows = get_out_turn_report_rows(
+        db=db,
+        location_code=location_code,
+        tank_asset_code=tank_asset_code,
+        product_name=product_name,
+        date_from=date_from,
+        date_to=date_to,
+        status=status,
+    )
+
+    return [
+        build_out_turn_report_response(row, db)
+        for row in rows
+    ]
+
+@app.get("/out-turn-report/validation")
+def validate_out_turn_report_tank_sequence(
+    location_code: str | None = None,
+    tank_asset_code: str | None = None,
+    product_name: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Out-Turn Report",
+        db,
+    )
+
+    date_from_value = parse_date_filter(date_from, "Date From")
+    date_to_value = parse_date_filter(date_to, "Date To")
+
+    # Important:
+    # For validation, fetch all rows up to date_to so that first visible row
+    # can still be validated against earlier stock continuity.
+    continuity_rows = get_out_turn_report_rows(
+        db=db,
+        location_code=location_code,
+        tank_asset_code=tank_asset_code,
+        product_name=product_name,
+        date_from=None,
+        date_to=date_to,
+        status="Active",
+    )
+
+    visible_rows = []
+
+    for row in continuity_rows:
+        if date_from_value and row.accounting_date and row.accounting_date < date_from_value:
+            continue
+
+        if date_to_value and row.accounting_date and row.accounting_date > date_to_value:
+            continue
+
+        visible_rows.append(row)
+
+    grouped_rows = {}
+
+    for row in continuity_rows:
+        key = (
+            row.location_code,
+            row.tank_asset_code,
+            row.product_name or "",
+        )
+
+        if key not in grouped_rows:
+            grouped_rows[key] = []
+
+        grouped_rows[key].append(row)
+
+    visible_ledger_ids = {row.id for row in visible_rows}
+
+    issues = []
+
+    for key, group_rows in grouped_rows.items():
+        location, tank, product = key
+
+        sorted_group_rows = sorted(
+            group_rows,
+            key=lambda row: (
+                row.accounting_date or date.min,
+                get_ledger_operation_datetime(row) or datetime.min,
+                row.id,
+            ),
+        )
+
+        previous_row = None
+
+        for row in sorted_group_rows:
+            if previous_row is None:
+                expected_previous_nsv = 0
+            else:
+                previous_snapshot = get_stock_snapshot_values(previous_row)
+                expected_previous_nsv = previous_snapshot["nsv"]
+
+            # Only report issues for rows inside the requested visible date range.
+            if row.id in visible_ledger_ids:
+                actual_previous_nsv = safe_float(row.previous_stock_nsv_bbl)
+
+                if round(actual_previous_nsv, 3) != round(expected_previous_nsv, 3):
+                    issues.append(
+                        {
+                            "ledger_id": row.id,
+                            "ticket_number": row.ticket_number,
+                            "location_code": location,
+                            "tank_asset_code": tank,
+                            "product_name": product or None,
+                            "expected_previous_nsv_bbl": round(
+                                expected_previous_nsv,
+                                3,
+                            ),
+                            "actual_previous_nsv_bbl": round(
+                                actual_previous_nsv,
+                                3,
+                            ),
+                            "message": (
+                                "Previous stock does not match previous row "
+                                "of the same tank/product sequence. Run ledger rebuild."
+                            ),
+                        }
+                    )
+
+            previous_row = row
+
+    return {
+        "rows_checked": len(visible_rows),
+        "groups_checked": len(grouped_rows),
+        "issues_count": len(issues),
+        "issues": issues,
+    }
 
 @app.post("/tank-stock-ledger/rebuild")
 def rebuild_tank_stock_ledger(
@@ -9432,6 +9836,39 @@ def rebuild_tank_stock_running_balances(
     previous_row = None
 
     for row_datetime, _row_id, row in sortable_rows:
+        # Backfill accounting day fields for old ledger rows created before
+        # Location Accounting Day Settings were connected to the ledger.
+        if (
+            row.accounting_date is None
+            or row.accounting_day_start is None
+            or row.accounting_day_end is None
+            or row.accounting_day_setting_id is None
+        ):
+            try:
+                payload = row.source_payload or {}
+
+                transaction_datetime = resolve_transaction_datetime_for_accounting_day(
+                    transaction=db.query(OperationTransaction)
+                    .filter(OperationTransaction.id == row.transaction_id)
+                    .first(),
+                    payload=payload,
+                )
+
+                accounting_day = get_location_accounting_day_for_transaction(
+                    db=db,
+                    location_code=row.location_code,
+                    transaction_datetime=transaction_datetime,
+                )
+
+                row.accounting_date = accounting_day["accounting_date"]
+                row.accounting_day_start = accounting_day["accounting_day_start"]
+                row.accounting_day_end = accounting_day["accounting_day_end"]
+                row.accounting_day_setting_id = accounting_day["setting_id"]
+
+            except Exception:
+                # Keep rebuild running for other rows.
+                # Validation will still show rows that could not be backfilled.
+                pass
         current_gsv_bbl = safe_float(row.stock_gsv_bbl)
         current_nsv_bbl = safe_float(row.stock_nsv_bbl)
         current_lt = safe_float(row.stock_lt)

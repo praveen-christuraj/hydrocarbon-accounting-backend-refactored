@@ -481,6 +481,61 @@ class TankStockLedgerDailySummaryResponse(BaseModel):
     rows_count: int = 0
     last_ticket_number: Optional[str] = None
 
+# -------------------------
+# Out-Turn Report Schemas
+# -------------------------
+
+class OutTurnReportResponse(BaseModel):
+    ledger_id: int
+    transaction_id: int
+
+    ticket_number: str
+    operation_number: str
+
+    accounting_date: Optional[date] = None
+    operation_datetime: Optional[datetime] = None
+
+    location_code: str
+    location_name: Optional[str] = None
+
+    tank_asset_code: str
+    tank_asset_name: Optional[str] = None
+
+    product_name: Optional[str] = None
+
+    tank_operation_code: str
+    tank_operation_label: str
+    tank_operation_category: str
+    tank_operation_sign: str
+
+    previous_stock_gsv_bbl: float = 0
+    previous_stock_nsv_bbl: float = 0
+    previous_stock_lt: float = 0
+    previous_stock_mt: float = 0
+
+    stock_after_gsv_bbl: float = 0
+    stock_after_nsv_bbl: float = 0
+    stock_after_lt: float = 0
+    stock_after_mt: float = 0
+
+    net_receipt_gsv_bbl: float = 0
+    net_receipt_nsv_bbl: float = 0
+    net_receipt_lt: float = 0
+    net_receipt_mt: float = 0
+
+    net_dispatch_gsv_bbl: float = 0
+    net_dispatch_nsv_bbl: float = 0
+    net_dispatch_lt: float = 0
+    net_dispatch_mt: float = 0
+
+    signed_net_movement_gsv_bbl: float = 0
+    signed_net_movement_nsv_bbl: float = 0
+    signed_net_movement_lt: float = 0
+    signed_net_movement_mt: float = 0
+
+    status: str
+    remarks: Optional[str] = None
+
 class LocationOperationAvailabilityBase(BaseModel):
     location_code: str
     operation_type_code: str
