@@ -587,6 +587,100 @@ class OperationTransaction(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now())
 
+class MaterialBalanceTemplate(Base):
+    __tablename__ = "material_balance_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    location_code = Column(String(50), nullable=False, index=True)
+    template_name = Column(String(150), nullable=False)
+
+    description = Column(Text, nullable=True)
+
+    # Only one Active template should normally be used per location.
+    # We are not enforcing that at database level yet because future versions
+    # may allow multiple templates per location/product.
+    status = Column(String(20), nullable=False, default="Active")
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "location_code",
+            "template_name",
+            name="unique_material_balance_template_per_location",
+        ),
+    )
+
+
+class MaterialBalanceTemplateColumn(Base):
+    __tablename__ = "material_balance_template_columns"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    template_id = Column(
+        Integer,
+        ForeignKey("material_balance_templates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    column_label = Column(String(150), nullable=False)
+    column_key = Column(String(120), nullable=False)
+    column_order = Column(Integer, nullable=False, default=1)
+
+    # Allowed values planned:
+    # OPENING, MOVEMENT, BOOK_CLOSING, ACTUAL_CLOSING, LOSS_GAIN, FORMULA, INFO
+    column_type = Column(String(50), nullable=False)
+
+    # For MOVEMENT columns only:
+    # IN, OUT, NEUTRAL
+    movement_direction = Column(String(20), nullable=True)
+
+    # List of Tank Operation codes selected by the user.
+    # Example: ["RECEIPT", "PRODUCTION", "RECEIPT_FROM_AGU"]
+    mapped_operation_codes = Column(JSONB, nullable=False, default=list)
+
+    # Extra safety list.
+    # Example: ["ITT_IN", "ITT_OUT", "INTERNAL_TANK_TRANSFER_IN"]
+    excluded_operation_codes = Column(JSONB, nullable=False, default=list)
+
+    # Yes/No. If No, this column can be displayed but not counted in Material Balance totals.
+    include_in_material_balance = Column(String(10), nullable=False, default="Yes")
+
+    # Yes/No. If No, this column is not included in Book Closing formula.
+    # Useful for ITT / internal transfers / informational columns.
+    include_in_book_closing = Column(String(10), nullable=False, default="Yes")
+
+    # Yes/No. Strong flag for future frontend/backend logic.
+    # Internal transfers should normally be Yes and excluded from book closing.
+    is_internal_transfer = Column(String(10), nullable=False, default="No")
+
+    # Optional future formula support.
+    # Example:
+    # {"op":"subtract","cols":["actual_closing","book_closing"]}
+    formula_json = Column(JSONB, nullable=True)
+
+    remarks = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="Active")
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "template_id",
+            "column_key",
+            name="unique_material_balance_column_key_per_template",
+        ),
+        UniqueConstraint(
+            "template_id",
+            "column_label",
+            name="unique_material_balance_column_label_per_template",
+        ),
+    )
+
 class Table11Factor(Base):
     __tablename__ = "table11_factors"
 

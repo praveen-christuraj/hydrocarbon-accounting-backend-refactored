@@ -536,6 +536,186 @@ class OutTurnReportResponse(BaseModel):
     status: str
     remarks: Optional[str] = None
 
+# -------------------------
+# Material Balance Template Configuration Schemas
+# -------------------------
+
+class MaterialBalanceTemplateBase(BaseModel):
+    location_code: str
+    template_name: str
+    description: Optional[str] = None
+    status: str = "Active"
+
+
+class MaterialBalanceTemplateCreate(MaterialBalanceTemplateBase):
+    pass
+
+
+class MaterialBalanceTemplateUpdate(MaterialBalanceTemplateBase):
+    pass
+
+
+class MaterialBalanceTemplateResponse(MaterialBalanceTemplateBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MaterialBalanceTemplateColumnBase(BaseModel):
+    column_label: str
+    column_key: str
+    column_order: int = 1
+    column_type: str
+    movement_direction: Optional[str] = None
+    mapped_operation_codes: list[str] = []
+    excluded_operation_codes: list[str] = []
+    include_in_material_balance: str = "Yes"
+    include_in_book_closing: str = "Yes"
+    is_internal_transfer: str = "No"
+    formula_json: Optional[Any] = None
+    remarks: Optional[str] = None
+    status: str = "Active"
+
+
+class MaterialBalanceTemplateColumnCreate(MaterialBalanceTemplateColumnBase):
+    pass
+
+
+class MaterialBalanceTemplateColumnUpdate(MaterialBalanceTemplateColumnBase):
+    pass
+
+
+class MaterialBalanceTemplateColumnResponse(MaterialBalanceTemplateColumnBase):
+    id: int
+    template_id: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MaterialBalanceTemplateDetailResponse(MaterialBalanceTemplateResponse):
+    columns: list[MaterialBalanceTemplateColumnResponse] = []
+
+# -------------------------
+# Material Balance Report Schemas
+# -------------------------
+
+class MaterialBalanceDynamicTemplateResponse(BaseModel):
+    id: int
+    location_code: str
+    template_name: str
+
+
+class MaterialBalanceDynamicColumnResponse(BaseModel):
+    column_key: str
+    column_label: str
+    column_order: int
+    column_type: str
+    movement_direction: Optional[str] = None
+    include_in_material_balance: str = "Yes"
+    include_in_book_closing: str = "Yes"
+    is_internal_transfer: str = "No"
+
+
+class MaterialBalanceDynamicRowResponse(BaseModel):
+    accounting_date: date
+
+    location_code: str
+    location_name: Optional[str] = None
+
+    tank_asset_code: Optional[str] = None
+    tank_asset_name: Optional[str] = None
+
+    product_name: Optional[str] = None
+
+    values: dict[str, Any] = {}
+
+    rows_count: int = 0
+    last_ticket_number: Optional[str] = None
+
+
+class MaterialBalanceDynamicReportResponse(BaseModel):
+    template: MaterialBalanceDynamicTemplateResponse
+    columns: list[MaterialBalanceDynamicColumnResponse]
+    rows: list[MaterialBalanceDynamicRowResponse]
+
+class MaterialBalanceReportResponse(BaseModel):
+    accounting_date: date
+
+    location_code: str
+    location_name: Optional[str] = None
+
+    tank_asset_code: Optional[str] = None
+    tank_asset_name: Optional[str] = None
+
+    product_name: Optional[str] = None
+
+    opening_gsv_bbl: float = 0
+    opening_nsv_bbl: float = 0
+    opening_lt: float = 0
+    opening_mt: float = 0
+
+    receipt_gsv_bbl: float = 0
+    receipt_nsv_bbl: float = 0
+    receipt_lt: float = 0
+    receipt_mt: float = 0
+
+    production_gsv_bbl: float = 0
+    production_nsv_bbl: float = 0
+    production_lt: float = 0
+    production_mt: float = 0
+
+    dispatch_gsv_bbl: float = 0
+    dispatch_nsv_bbl: float = 0
+    dispatch_lt: float = 0
+    dispatch_mt: float = 0
+
+    draining_gsv_bbl: float = 0
+    draining_nsv_bbl: float = 0
+    draining_lt: float = 0
+    draining_mt: float = 0
+
+    other_in_gsv_bbl: float = 0
+    other_in_nsv_bbl: float = 0
+    other_in_lt: float = 0
+    other_in_mt: float = 0
+
+    other_out_gsv_bbl: float = 0
+    other_out_nsv_bbl: float = 0
+    other_out_lt: float = 0
+    other_out_mt: float = 0
+
+    total_in_gsv_bbl: float = 0
+    total_in_nsv_bbl: float = 0
+    total_in_lt: float = 0
+    total_in_mt: float = 0
+
+    total_out_gsv_bbl: float = 0
+    total_out_nsv_bbl: float = 0
+    total_out_lt: float = 0
+    total_out_mt: float = 0
+
+    book_closing_gsv_bbl: float = 0
+    book_closing_nsv_bbl: float = 0
+    book_closing_lt: float = 0
+    book_closing_mt: float = 0
+
+    actual_closing_gsv_bbl: float = 0
+    actual_closing_nsv_bbl: float = 0
+    actual_closing_lt: float = 0
+    actual_closing_mt: float = 0
+
+    loss_gain_gsv_bbl: float = 0
+    loss_gain_nsv_bbl: float = 0
+    loss_gain_lt: float = 0
+    loss_gain_mt: float = 0
+
+    rows_count: int = 0
+    last_ticket_number: Optional[str] = None
+
 class LocationOperationAvailabilityBase(BaseModel):
     location_code: str
     operation_type_code: str

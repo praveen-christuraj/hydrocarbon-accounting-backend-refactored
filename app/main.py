@@ -51,6 +51,8 @@ from app.models import (
     OperationType,
     TankOperation,
     TankStockLedger,
+    MaterialBalanceTemplate,
+    MaterialBalanceTemplateColumn,
     Permission,
     Role,
     RolePermission,
@@ -97,6 +99,15 @@ from app.schemas import (
     TankStockLedgerSummaryResponse,
     TankStockLedgerDailySummaryResponse,
     OutTurnReportResponse,
+    MaterialBalanceReportResponse,
+    MaterialBalanceDynamicReportResponse,
+    MaterialBalanceTemplateCreate,
+    MaterialBalanceTemplateUpdate,
+    MaterialBalanceTemplateResponse,
+    MaterialBalanceTemplateColumnCreate,
+    MaterialBalanceTemplateColumnUpdate,
+    MaterialBalanceTemplateColumnResponse,
+    MaterialBalanceTemplateDetailResponse,
     PermissionCreate,
     PermissionResponse,
     RoleCreate,
@@ -1722,6 +1733,21 @@ def seed_standard_permissions(
             "permission_name": "View Out-Turn Report",
             "module_name": "Reports",
             "description": "Can view Out-Turn Report from approved tank stock ledger rows",
+        },
+        {
+            "permission_name": "View Material Balance Report",
+            "module_name": "Reports",
+            "description": "Can view Material Balance Report from tank stock ledger",
+        },
+        {
+            "permission_name": "View Material Balance Template",
+            "module_name": "Configuration",
+            "description": "Can view Material Balance template configuration",
+        },
+        {
+            "permission_name": "Manage Material Balance Template",
+            "module_name": "Configuration",
+            "description": "Can create, edit, and delete Material Balance template configuration",
         },
     ]
 
@@ -5872,6 +5898,1125 @@ def build_tank_stock_daily_summary_rows(
         ),
     )
 
+# -------------------------
+# Material Balance Report Helpers
+# -------------------------
+
+def normalize_material_balance_category(value: str | None):
+    text = str(value or "").strip().upper()
+
+    if "RECEIPT" in text:
+        return "RECEIPT"
+
+    if "PRODUCTION" in text:
+        return "PRODUCTION"
+
+    if "DISPATCH" in text:
+        return "DISPATCH"
+
+    if "DRAIN" in text:
+        return "DRAINING"
+
+    if "OPENING" in text:
+        return "OPENING"
+
+    if "CLOSING" in text:
+        return "CLOSING"
+
+    return text or "OTHER"
+
+
+def add_volume_values(target: dict, prefix: str, row: TankStockLedger):
+    target[f"{prefix}_gsv"] += safe_float(row.movement_gsv_bbl)
+    target[f"{prefix}_nsv"] += safe_float(row.movement_nsv_bbl)
+    target[f"{prefix}_lt"] += safe_float(row.movement_lt)
+    target[f"{prefix}_mt"] += safe_float(row.movement_mt)
+
+
+def get_material_balance_rows_for_continuity(
+    db: Session,
+    location_code: str | None,
+    tank_asset_code: str | None,
+    product_name: str | None,
+    date_to_value: date,
+):
+    query = db.query(TankStockLedger).filter(
+        TankStockLedger.status == "Active",
+        TankStockLedger.accounting_date != None,
+        TankStockLedger.accounting_date <= date_to_value,
+    )
+
+    cleaned_location_code = clean_optional_text(location_code)
+    cleaned_tank_asset_code = clean_optional_text(tank_asset_code)
+    cleaned_product_name = clean_optional_text(product_name)
+
+    if cleaned_location_code:
+        query = query.filter(
+            TankStockLedger.location_code.ilike(cleaned_location_code)
+        )
+
+    if cleaned_tank_asset_code:
+        query = query.filter(
+            TankStockLedger.tank_asset_code.ilike(cleaned_tank_asset_code)
+        )
+
+    if cleaned_product_name:
+        query = query.filter(
+            TankStockLedger.product_name.ilike(cleaned_product_name)
+        )
+
+    rows = query.all()
+
+    return sorted(
+        rows,
+        key=lambda row: (
+            row.location_code or "",
+            row.tank_asset_code or "",
+            row.product_name or "",
+            row.accounting_date or date.min,
+            get_ledger_operation_datetime(row) or datetime.min,
+            row.id,
+        ),
+    )
+
+
+def build_material_balance_report_rows(
+    db: Session,
+    ledger_rows: list[TankStockLedger],
+    date_from_value: date,
+    date_to_value: date,
+):
+    date_range = build_date_range(date_from_value, date_to_value)
+
+    grouped_rows = {}
+
+    for row in ledger_rows:
+        key = (
+            row.location_code,
+            row.tank_asset_code,
+            row.product_name or "",
+        )
+
+        if key not in grouped_rows:
+            grouped_rows[key] = []
+
+        grouped_rows[key].append(row)
+
+    material_balance_rows = []
+
+    for key, rows in grouped_rows.items():
+        location_code, tank_asset_code, product_name_value = key
+
+        location = get_location_by_code(location_code, db)
+
+        sorted_rows = sorted(
+            rows,
+            key=lambda row: (
+                row.accounting_date or date.min,
+                get_ledger_operation_datetime(row) or datetime.min,
+                row.id,
+            ),
+        )
+
+        tank_asset_name = ""
+        if sorted_rows:
+            tank_asset_name = sorted_rows[-1].tank_asset_name or ""
+
+        previous_closing_gsv = 0
+        previous_closing_nsv = 0
+        previous_closing_lt = 0
+        previous_closing_mt = 0
+
+        rows_before_period = [
+            row
+            for row in sorted_rows
+            if row.accounting_date is not None
+            and row.accounting_date < date_from_value
+        ]
+
+        if rows_before_period:
+            last_before_period = rows_before_period[-1]
+            previous_snapshot = get_stock_snapshot_values(last_before_period)
+
+            previous_closing_gsv = previous_snapshot["gsv"]
+            previous_closing_nsv = previous_snapshot["nsv"]
+            previous_closing_lt = previous_snapshot["lt"]
+            previous_closing_mt = previous_snapshot["mt"]
+
+        for accounting_date_value in date_range:
+            day_rows = [
+                row
+                for row in sorted_rows
+                if row.accounting_date == accounting_date_value
+            ]
+
+            day_rows = sorted(
+                day_rows,
+                key=lambda row: (
+                    get_ledger_operation_datetime(row) or datetime.min,
+                    row.id,
+                ),
+            )
+
+            opening_gsv = previous_closing_gsv
+            opening_nsv = previous_closing_nsv
+            opening_lt = previous_closing_lt
+            opening_mt = previous_closing_mt
+
+            opening_rows = [
+                row
+                for row in day_rows
+                if normalize_material_balance_category(
+                    row.tank_operation_category
+                )
+                == "OPENING"
+            ]
+
+            if opening_rows:
+                opening_snapshot = get_stock_snapshot_values(opening_rows[-1])
+
+                opening_gsv = opening_snapshot["gsv"]
+                opening_nsv = opening_snapshot["nsv"]
+                opening_lt = opening_snapshot["lt"]
+                opening_mt = opening_snapshot["mt"]
+
+            buckets = {
+                "receipt_gsv": 0,
+                "receipt_nsv": 0,
+                "receipt_lt": 0,
+                "receipt_mt": 0,
+                "production_gsv": 0,
+                "production_nsv": 0,
+                "production_lt": 0,
+                "production_mt": 0,
+                "dispatch_gsv": 0,
+                "dispatch_nsv": 0,
+                "dispatch_lt": 0,
+                "dispatch_mt": 0,
+                "draining_gsv": 0,
+                "draining_nsv": 0,
+                "draining_lt": 0,
+                "draining_mt": 0,
+                "other_in_gsv": 0,
+                "other_in_nsv": 0,
+                "other_in_lt": 0,
+                "other_in_mt": 0,
+                "other_out_gsv": 0,
+                "other_out_nsv": 0,
+                "other_out_lt": 0,
+                "other_out_mt": 0,
+            }
+
+            for row in day_rows:
+                sign = str(row.tank_operation_sign or "").upper()
+                category = normalize_material_balance_category(
+                    row.tank_operation_category
+                )
+
+                if sign == "IN":
+                    if category == "RECEIPT":
+                        add_volume_values(buckets, "receipt", row)
+                    elif category == "PRODUCTION":
+                        add_volume_values(buckets, "production", row)
+                    else:
+                        add_volume_values(buckets, "other_in", row)
+
+                elif sign == "OUT":
+                    if category == "DISPATCH":
+                        add_volume_values(buckets, "dispatch", row)
+                    elif category == "DRAINING":
+                        add_volume_values(buckets, "draining", row)
+                    else:
+                        add_volume_values(buckets, "other_out", row)
+
+            total_in_gsv = (
+                buckets["receipt_gsv"]
+                + buckets["production_gsv"]
+                + buckets["other_in_gsv"]
+            )
+            total_in_nsv = (
+                buckets["receipt_nsv"]
+                + buckets["production_nsv"]
+                + buckets["other_in_nsv"]
+            )
+            total_in_lt = (
+                buckets["receipt_lt"]
+                + buckets["production_lt"]
+                + buckets["other_in_lt"]
+            )
+            total_in_mt = (
+                buckets["receipt_mt"]
+                + buckets["production_mt"]
+                + buckets["other_in_mt"]
+            )
+
+            total_out_gsv = (
+                buckets["dispatch_gsv"]
+                + buckets["draining_gsv"]
+                + buckets["other_out_gsv"]
+            )
+            total_out_nsv = (
+                buckets["dispatch_nsv"]
+                + buckets["draining_nsv"]
+                + buckets["other_out_nsv"]
+            )
+            total_out_lt = (
+                buckets["dispatch_lt"]
+                + buckets["draining_lt"]
+                + buckets["other_out_lt"]
+            )
+            total_out_mt = (
+                buckets["dispatch_mt"]
+                + buckets["draining_mt"]
+                + buckets["other_out_mt"]
+            )
+
+            book_closing_gsv = opening_gsv + total_in_gsv - total_out_gsv
+            book_closing_nsv = opening_nsv + total_in_nsv - total_out_nsv
+            book_closing_lt = opening_lt + total_in_lt - total_out_lt
+            book_closing_mt = opening_mt + total_in_mt - total_out_mt
+
+            actual_closing_gsv = book_closing_gsv
+            actual_closing_nsv = book_closing_nsv
+            actual_closing_lt = book_closing_lt
+            actual_closing_mt = book_closing_mt
+
+            last_ticket_number = None
+
+            if day_rows:
+                closing_rows = [
+                    row
+                    for row in day_rows
+                    if normalize_material_balance_category(
+                        row.tank_operation_category
+                    )
+                    == "CLOSING"
+                ]
+
+                if closing_rows:
+                    closing_source_row = closing_rows[-1]
+                else:
+                    closing_source_row = day_rows[-1]
+
+                closing_snapshot = get_stock_snapshot_values(closing_source_row)
+
+                actual_closing_gsv = closing_snapshot["gsv"]
+                actual_closing_nsv = closing_snapshot["nsv"]
+                actual_closing_lt = closing_snapshot["lt"]
+                actual_closing_mt = closing_snapshot["mt"]
+
+                last_ticket_number = closing_source_row.ticket_number
+
+            else:
+                # No entry in this accounting day: carry forward previous closing.
+                actual_closing_gsv = opening_gsv
+                actual_closing_nsv = opening_nsv
+                actual_closing_lt = opening_lt
+                actual_closing_mt = opening_mt
+
+                book_closing_gsv = opening_gsv
+                book_closing_nsv = opening_nsv
+                book_closing_lt = opening_lt
+                book_closing_mt = opening_mt
+
+            loss_gain_gsv = actual_closing_gsv - book_closing_gsv
+            loss_gain_nsv = actual_closing_nsv - book_closing_nsv
+            loss_gain_lt = actual_closing_lt - book_closing_lt
+            loss_gain_mt = actual_closing_mt - book_closing_mt
+
+            material_balance_rows.append(
+                {
+                    "accounting_date": accounting_date_value,
+                    "location_code": location_code,
+                    "location_name": location.location_name if location else "",
+                    "tank_asset_code": tank_asset_code,
+                    "tank_asset_name": tank_asset_name,
+                    "product_name": product_name_value or None,
+                    "opening_gsv_bbl": round(opening_gsv, 3),
+                    "opening_nsv_bbl": round(opening_nsv, 3),
+                    "opening_lt": round(opening_lt, 3),
+                    "opening_mt": round(opening_mt, 3),
+                    "receipt_gsv_bbl": round(buckets["receipt_gsv"], 3),
+                    "receipt_nsv_bbl": round(buckets["receipt_nsv"], 3),
+                    "receipt_lt": round(buckets["receipt_lt"], 3),
+                    "receipt_mt": round(buckets["receipt_mt"], 3),
+                    "production_gsv_bbl": round(buckets["production_gsv"], 3),
+                    "production_nsv_bbl": round(buckets["production_nsv"], 3),
+                    "production_lt": round(buckets["production_lt"], 3),
+                    "production_mt": round(buckets["production_mt"], 3),
+                    "dispatch_gsv_bbl": round(buckets["dispatch_gsv"], 3),
+                    "dispatch_nsv_bbl": round(buckets["dispatch_nsv"], 3),
+                    "dispatch_lt": round(buckets["dispatch_lt"], 3),
+                    "dispatch_mt": round(buckets["dispatch_mt"], 3),
+                    "draining_gsv_bbl": round(buckets["draining_gsv"], 3),
+                    "draining_nsv_bbl": round(buckets["draining_nsv"], 3),
+                    "draining_lt": round(buckets["draining_lt"], 3),
+                    "draining_mt": round(buckets["draining_mt"], 3),
+                    "other_in_gsv_bbl": round(buckets["other_in_gsv"], 3),
+                    "other_in_nsv_bbl": round(buckets["other_in_nsv"], 3),
+                    "other_in_lt": round(buckets["other_in_lt"], 3),
+                    "other_in_mt": round(buckets["other_in_mt"], 3),
+                    "other_out_gsv_bbl": round(buckets["other_out_gsv"], 3),
+                    "other_out_nsv_bbl": round(buckets["other_out_nsv"], 3),
+                    "other_out_lt": round(buckets["other_out_lt"], 3),
+                    "other_out_mt": round(buckets["other_out_mt"], 3),
+                    "total_in_gsv_bbl": round(total_in_gsv, 3),
+                    "total_in_nsv_bbl": round(total_in_nsv, 3),
+                    "total_in_lt": round(total_in_lt, 3),
+                    "total_in_mt": round(total_in_mt, 3),
+                    "total_out_gsv_bbl": round(total_out_gsv, 3),
+                    "total_out_nsv_bbl": round(total_out_nsv, 3),
+                    "total_out_lt": round(total_out_lt, 3),
+                    "total_out_mt": round(total_out_mt, 3),
+                    "book_closing_gsv_bbl": round(book_closing_gsv, 3),
+                    "book_closing_nsv_bbl": round(book_closing_nsv, 3),
+                    "book_closing_lt": round(book_closing_lt, 3),
+                    "book_closing_mt": round(book_closing_mt, 3),
+                    "actual_closing_gsv_bbl": round(actual_closing_gsv, 3),
+                    "actual_closing_nsv_bbl": round(actual_closing_nsv, 3),
+                    "actual_closing_lt": round(actual_closing_lt, 3),
+                    "actual_closing_mt": round(actual_closing_mt, 3),
+                    "loss_gain_gsv_bbl": round(loss_gain_gsv, 3),
+                    "loss_gain_nsv_bbl": round(loss_gain_nsv, 3),
+                    "loss_gain_lt": round(loss_gain_lt, 3),
+                    "loss_gain_mt": round(loss_gain_mt, 3),
+                    "rows_count": len(day_rows),
+                    "last_ticket_number": last_ticket_number,
+                }
+            )
+
+            previous_closing_gsv = actual_closing_gsv
+            previous_closing_nsv = actual_closing_nsv
+            previous_closing_lt = actual_closing_lt
+            previous_closing_mt = actual_closing_mt
+
+    return sorted(
+        material_balance_rows,
+        key=lambda row: (
+            row["accounting_date"],
+            row["location_code"],
+            row["tank_asset_code"] or "",
+            row["product_name"] or "",
+        ),
+    )
+
+def consolidate_material_balance_rows_by_location(
+    tank_wise_rows: list[dict],
+):
+    consolidated_map = {}
+
+    for row in tank_wise_rows:
+        key = (
+            row["accounting_date"],
+            row["location_code"],
+            row["product_name"] or "",
+        )
+
+        if key not in consolidated_map:
+            consolidated_map[key] = {
+                "accounting_date": row["accounting_date"],
+                "location_code": row["location_code"],
+                "location_name": row["location_name"],
+                "tank_asset_code": None,
+                "tank_asset_name": "All Tanks",
+                "product_name": row["product_name"],
+                "opening_gsv_bbl": 0,
+                "opening_nsv_bbl": 0,
+                "opening_lt": 0,
+                "opening_mt": 0,
+                "receipt_gsv_bbl": 0,
+                "receipt_nsv_bbl": 0,
+                "receipt_lt": 0,
+                "receipt_mt": 0,
+                "production_gsv_bbl": 0,
+                "production_nsv_bbl": 0,
+                "production_lt": 0,
+                "production_mt": 0,
+                "dispatch_gsv_bbl": 0,
+                "dispatch_nsv_bbl": 0,
+                "dispatch_lt": 0,
+                "dispatch_mt": 0,
+                "draining_gsv_bbl": 0,
+                "draining_nsv_bbl": 0,
+                "draining_lt": 0,
+                "draining_mt": 0,
+                "other_in_gsv_bbl": 0,
+                "other_in_nsv_bbl": 0,
+                "other_in_lt": 0,
+                "other_in_mt": 0,
+                "other_out_gsv_bbl": 0,
+                "other_out_nsv_bbl": 0,
+                "other_out_lt": 0,
+                "other_out_mt": 0,
+                "total_in_gsv_bbl": 0,
+                "total_in_nsv_bbl": 0,
+                "total_in_lt": 0,
+                "total_in_mt": 0,
+                "total_out_gsv_bbl": 0,
+                "total_out_nsv_bbl": 0,
+                "total_out_lt": 0,
+                "total_out_mt": 0,
+                "book_closing_gsv_bbl": 0,
+                "book_closing_nsv_bbl": 0,
+                "book_closing_lt": 0,
+                "book_closing_mt": 0,
+                "actual_closing_gsv_bbl": 0,
+                "actual_closing_nsv_bbl": 0,
+                "actual_closing_lt": 0,
+                "actual_closing_mt": 0,
+                "loss_gain_gsv_bbl": 0,
+                "loss_gain_nsv_bbl": 0,
+                "loss_gain_lt": 0,
+                "loss_gain_mt": 0,
+                "rows_count": 0,
+                "last_ticket_number": None,
+            }
+
+        target = consolidated_map[key]
+
+        numeric_fields = [
+            "opening_gsv_bbl",
+            "opening_nsv_bbl",
+            "opening_lt",
+            "opening_mt",
+            "receipt_gsv_bbl",
+            "receipt_nsv_bbl",
+            "receipt_lt",
+            "receipt_mt",
+            "production_gsv_bbl",
+            "production_nsv_bbl",
+            "production_lt",
+            "production_mt",
+            "dispatch_gsv_bbl",
+            "dispatch_nsv_bbl",
+            "dispatch_lt",
+            "dispatch_mt",
+            "draining_gsv_bbl",
+            "draining_nsv_bbl",
+            "draining_lt",
+            "draining_mt",
+            "other_in_gsv_bbl",
+            "other_in_nsv_bbl",
+            "other_in_lt",
+            "other_in_mt",
+            "other_out_gsv_bbl",
+            "other_out_nsv_bbl",
+            "other_out_lt",
+            "other_out_mt",
+            "total_in_gsv_bbl",
+            "total_in_nsv_bbl",
+            "total_in_lt",
+            "total_in_mt",
+            "total_out_gsv_bbl",
+            "total_out_nsv_bbl",
+            "total_out_lt",
+            "total_out_mt",
+            "book_closing_gsv_bbl",
+            "book_closing_nsv_bbl",
+            "book_closing_lt",
+            "book_closing_mt",
+            "actual_closing_gsv_bbl",
+            "actual_closing_nsv_bbl",
+            "actual_closing_lt",
+            "actual_closing_mt",
+            "loss_gain_gsv_bbl",
+            "loss_gain_nsv_bbl",
+            "loss_gain_lt",
+            "loss_gain_mt",
+        ]
+
+        for field in numeric_fields:
+            target[field] += safe_float(row.get(field))
+
+        target["rows_count"] += int(row.get("rows_count") or 0)
+
+        if row.get("last_ticket_number"):
+            target["last_ticket_number"] = row.get("last_ticket_number")
+
+    consolidated_rows = []
+
+    for row in consolidated_map.values():
+        for key, value in list(row.items()):
+            if isinstance(value, float):
+                row[key] = round(value, 3)
+
+        consolidated_rows.append(row)
+
+    return sorted(
+        consolidated_rows,
+        key=lambda row: (
+            row["accounting_date"],
+            row["location_code"],
+            row["product_name"] or "",
+        ),
+    )
+
+# -------------------------
+# Dynamic Material Balance Report Helpers
+# -------------------------
+
+def normalize_material_balance_code_value(value):
+    return str(value or "").strip().upper()
+
+
+def get_active_material_balance_template_for_location(
+    db: Session,
+    location_code: str,
+):
+    template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(
+            MaterialBalanceTemplate.location_code.ilike(location_code),
+            MaterialBalanceTemplate.status == "Active",
+        )
+        .order_by(MaterialBalanceTemplate.id.desc())
+        .first()
+    )
+
+    if not template:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No Active Material Balance Template found for this location. "
+                "Please configure Material Balance Template first."
+            ),
+        )
+
+    return template
+
+
+def get_active_material_balance_template_columns(
+    db: Session,
+    template_id: int,
+):
+    columns = (
+        db.query(MaterialBalanceTemplateColumn)
+        .filter(
+            MaterialBalanceTemplateColumn.template_id == template_id,
+            MaterialBalanceTemplateColumn.status == "Active",
+        )
+        .order_by(
+            MaterialBalanceTemplateColumn.column_order.asc(),
+            MaterialBalanceTemplateColumn.id.asc(),
+        )
+        .all()
+    )
+
+    if not columns:
+        raise HTTPException(
+            status_code=400,
+            detail="No Active columns configured for this Material Balance Template.",
+        )
+
+    return columns
+
+
+def build_dynamic_material_balance_columns_response(
+    columns: list[MaterialBalanceTemplateColumn],
+):
+    return [
+        {
+            "column_key": column.column_key,
+            "column_label": column.column_label,
+            "column_order": column.column_order,
+            "column_type": column.column_type,
+            "movement_direction": column.movement_direction,
+            "include_in_material_balance": column.include_in_material_balance,
+            "include_in_book_closing": column.include_in_book_closing,
+            "is_internal_transfer": column.is_internal_transfer,
+        }
+        for column in columns
+    ]
+
+
+def get_movement_value_for_unit(row: TankStockLedger, unit_key: str = "nsv"):
+    if unit_key == "gsv":
+        return safe_float(row.movement_gsv_bbl)
+
+    if unit_key == "lt":
+        return safe_float(row.movement_lt)
+
+    if unit_key == "mt":
+        return safe_float(row.movement_mt)
+
+    return safe_float(row.movement_nsv_bbl)
+
+
+def get_snapshot_value_for_unit(snapshot: dict, unit_key: str = "nsv"):
+    if unit_key == "gsv":
+        return safe_float(snapshot.get("gsv"))
+
+    if unit_key == "lt":
+        return safe_float(snapshot.get("lt"))
+
+    if unit_key == "mt":
+        return safe_float(snapshot.get("mt"))
+
+    return safe_float(snapshot.get("nsv"))
+
+
+def should_row_match_material_balance_column(
+    row: TankStockLedger,
+    column: MaterialBalanceTemplateColumn,
+):
+    if normalize_material_balance_code_value(column.column_type) != "MOVEMENT":
+        return False
+
+    row_operation_code = normalize_material_balance_code_value(
+        row.tank_operation_code
+    )
+
+    row_sign = normalize_material_balance_code_value(row.tank_operation_sign)
+    column_direction = normalize_material_balance_code_value(
+        column.movement_direction
+    )
+
+    mapped_operation_codes = {
+        normalize_material_balance_code_value(code)
+        for code in (column.mapped_operation_codes or [])
+    }
+
+    excluded_operation_codes = {
+        normalize_material_balance_code_value(code)
+        for code in (column.excluded_operation_codes or [])
+    }
+
+    if row_operation_code in excluded_operation_codes:
+        return False
+
+    if mapped_operation_codes and row_operation_code not in mapped_operation_codes:
+        return False
+
+    if column_direction and row_sign != column_direction:
+        return False
+
+    return True
+
+def get_global_internal_transfer_operation_codes(
+    columns: list[MaterialBalanceTemplateColumn],
+):
+    internal_codes = set()
+
+    for column in columns:
+        is_internal_transfer = (
+            normalize_material_balance_code_value(column.is_internal_transfer)
+            == "YES"
+        )
+
+        include_in_material_balance = (
+            normalize_material_balance_code_value(column.include_in_material_balance)
+            == "YES"
+        )
+
+        include_in_book_closing = (
+            normalize_material_balance_code_value(column.include_in_book_closing)
+            == "YES"
+        )
+
+        # Any operation mapped to an internal transfer column must be globally
+        # excluded from Book Closing, even if accidentally mapped elsewhere.
+        if is_internal_transfer:
+            for code in column.mapped_operation_codes or []:
+                internal_codes.add(normalize_material_balance_code_value(code))
+
+        # Extra safety:
+        # If a movement column is explicitly excluded from both MB and Book Closing,
+        # treat its mapped operation codes as non-book-closing operations.
+        if (
+            normalize_material_balance_code_value(column.column_type) == "MOVEMENT"
+            and not include_in_material_balance
+            and not include_in_book_closing
+        ):
+            for code in column.mapped_operation_codes or []:
+                internal_codes.add(normalize_material_balance_code_value(code))
+
+    return internal_codes
+
+
+def should_row_be_in_book_closing_formula(
+    row: TankStockLedger,
+    columns: list[MaterialBalanceTemplateColumn],
+    global_internal_transfer_codes: set[str],
+):
+    row_operation_code = normalize_material_balance_code_value(
+        row.tank_operation_code
+    )
+
+    row_sign = normalize_material_balance_code_value(row.tank_operation_sign)
+
+    if row_sign not in ["IN", "OUT"]:
+        return False
+
+    if row_operation_code in global_internal_transfer_codes:
+        return False
+
+    for column in columns:
+        column_type = normalize_material_balance_code_value(column.column_type)
+
+        if column_type != "MOVEMENT":
+            continue
+
+        include_in_material_balance = (
+            normalize_material_balance_code_value(column.include_in_material_balance)
+            == "YES"
+        )
+
+        include_in_book_closing = (
+            normalize_material_balance_code_value(column.include_in_book_closing)
+            == "YES"
+        )
+
+        is_internal_transfer = (
+            normalize_material_balance_code_value(column.is_internal_transfer)
+            == "YES"
+        )
+
+        if not include_in_material_balance:
+            continue
+
+        if not include_in_book_closing:
+            continue
+
+        if is_internal_transfer:
+            continue
+
+        if should_row_match_material_balance_column(row, column):
+            return True
+
+    return False
+
+
+def calculate_book_closing_from_eligible_ledger_rows(
+    opening_value: float,
+    day_rows: list[TankStockLedger],
+    columns: list[MaterialBalanceTemplateColumn],
+    unit_key: str,
+):
+    global_internal_transfer_codes = get_global_internal_transfer_operation_codes(
+        columns
+    )
+
+    eligible_in_total = 0
+    eligible_out_total = 0
+    included_ledger_ids = set()
+
+    for row in day_rows:
+        if row.id in included_ledger_ids:
+            continue
+
+        if not should_row_be_in_book_closing_formula(
+            row=row,
+            columns=columns,
+            global_internal_transfer_codes=global_internal_transfer_codes,
+        ):
+            continue
+
+        movement_value = get_movement_value_for_unit(row, unit_key)
+        row_sign = normalize_material_balance_code_value(row.tank_operation_sign)
+
+        if row_sign == "IN":
+            eligible_in_total += movement_value
+            included_ledger_ids.add(row.id)
+
+        elif row_sign == "OUT":
+            eligible_out_total += movement_value
+            included_ledger_ids.add(row.id)
+
+    book_closing_value = opening_value + eligible_in_total - eligible_out_total
+
+    return {
+        "book_closing_value": book_closing_value,
+        "eligible_in_total": eligible_in_total,
+        "eligible_out_total": eligible_out_total,
+        "included_ledger_ids": sorted(list(included_ledger_ids)),
+    }
+
+def build_dynamic_material_balance_tank_rows(
+    db: Session,
+    ledger_rows: list[TankStockLedger],
+    columns: list[MaterialBalanceTemplateColumn],
+    date_from_value: date,
+    date_to_value: date,
+    unit_key: str = "nsv",
+):
+    date_range = build_date_range(date_from_value, date_to_value)
+
+    grouped_rows = {}
+
+    for row in ledger_rows:
+        key = (
+            row.location_code,
+            row.tank_asset_code,
+            row.product_name or "",
+        )
+
+        if key not in grouped_rows:
+            grouped_rows[key] = []
+
+        grouped_rows[key].append(row)
+
+    report_rows = []
+
+    for key, rows in grouped_rows.items():
+        location_code, tank_asset_code, product_name_value = key
+        location = get_location_by_code(location_code, db)
+
+        sorted_rows = sorted(
+            rows,
+            key=lambda row: (
+                row.accounting_date or date.min,
+                get_ledger_operation_datetime(row) or datetime.min,
+                row.id,
+            ),
+        )
+
+        tank_asset_name = ""
+
+        if sorted_rows:
+            tank_asset_name = sorted_rows[-1].tank_asset_name or ""
+
+        previous_closing_snapshot = {
+            "gsv": 0,
+            "nsv": 0,
+            "lt": 0,
+            "mt": 0,
+        }
+
+        rows_before_period = [
+            row
+            for row in sorted_rows
+            if row.accounting_date is not None
+            and row.accounting_date < date_from_value
+        ]
+
+        if rows_before_period:
+            previous_closing_snapshot = get_stock_snapshot_values(
+                rows_before_period[-1]
+            )
+
+        for accounting_date_value in date_range:
+            day_rows = [
+                row
+                for row in sorted_rows
+                if row.accounting_date == accounting_date_value
+            ]
+
+            day_rows = sorted(
+                day_rows,
+                key=lambda row: (
+                    get_ledger_operation_datetime(row) or datetime.min,
+                    row.id,
+                ),
+            )
+
+            opening_value = get_snapshot_value_for_unit(
+                previous_closing_snapshot,
+                unit_key,
+            )
+
+            explicit_opening_rows = [
+                row
+                for row in day_rows
+                if normalize_material_balance_code_value(
+                    row.tank_operation_category
+                )
+                == "OPENING"
+            ]
+
+            if explicit_opening_rows:
+                opening_snapshot = get_stock_snapshot_values(
+                    explicit_opening_rows[-1]
+                )
+                opening_value = get_snapshot_value_for_unit(
+                    opening_snapshot,
+                    unit_key,
+                )
+
+            values = {}
+
+            book_closing_value = opening_value
+            actual_closing_value = opening_value
+            last_ticket_number = None
+
+            # First pass: calculate configured columns except computed closing/loss.
+            for column in columns:
+                column_key = column.column_key
+                column_type = normalize_material_balance_code_value(
+                    column.column_type
+                )
+
+                if column_type == "OPENING":
+                    values[column_key] = round(opening_value, 3)
+                    continue
+
+                if column_type == "MOVEMENT":
+                    movement_total = 0
+
+                    for row in day_rows:
+                        if should_row_match_material_balance_column(row, column):
+                            movement_total += get_movement_value_for_unit(
+                                row,
+                                unit_key,
+                            )
+
+                    values[column_key] = round(movement_total, 3)
+                    continue
+
+                if column_type in ["INFO", "FORMULA"]:
+                    values[column_key] = 0
+                    continue
+
+            book_closing_calculation = calculate_book_closing_from_eligible_ledger_rows(
+                opening_value=opening_value,
+                day_rows=day_rows,
+                columns=columns,
+                unit_key=unit_key,
+            )
+
+            book_closing_value = book_closing_calculation["book_closing_value"]
+
+            if day_rows:
+                explicit_closing_rows = [
+                    row
+                    for row in day_rows
+                    if normalize_material_balance_code_value(
+                        row.tank_operation_category
+                    )
+                    == "CLOSING"
+                ]
+
+                if explicit_closing_rows:
+                    closing_source_row = explicit_closing_rows[-1]
+                else:
+                    closing_source_row = day_rows[-1]
+
+                actual_closing_snapshot = get_stock_snapshot_values(
+                    closing_source_row
+                )
+
+                actual_closing_value = get_snapshot_value_for_unit(
+                    actual_closing_snapshot,
+                    unit_key,
+                )
+
+                last_ticket_number = closing_source_row.ticket_number
+            else:
+                actual_closing_snapshot = previous_closing_snapshot
+                actual_closing_value = opening_value
+
+            loss_gain_value = actual_closing_value - book_closing_value
+
+            # Second pass: fill computed columns.
+            for column in columns:
+                column_key = column.column_key
+                column_type = normalize_material_balance_code_value(
+                    column.column_type
+                )
+
+                if column_type == "BOOK_CLOSING":
+                    values[column_key] = round(book_closing_value, 3)
+
+                elif column_type == "ACTUAL_CLOSING":
+                    values[column_key] = round(actual_closing_value, 3)
+
+                elif column_type == "LOSS_GAIN":
+                    values[column_key] = round(loss_gain_value, 3)
+
+            report_rows.append(
+                {
+                    "accounting_date": accounting_date_value,
+                    "location_code": location_code,
+                    "location_name": location.location_name if location else "",
+                    "tank_asset_code": tank_asset_code,
+                    "tank_asset_name": tank_asset_name,
+                    "product_name": product_name_value or None,
+                    "values": values,
+                    "rows_count": len(day_rows),
+                    "last_ticket_number": last_ticket_number,
+                }
+            )
+
+            previous_closing_snapshot = {
+                "gsv": actual_closing_snapshot.get("gsv", actual_closing_value),
+                "nsv": actual_closing_snapshot.get("nsv", actual_closing_value),
+                "lt": actual_closing_snapshot.get("lt", 0),
+                "mt": actual_closing_snapshot.get("mt", 0),
+            }
+
+    return sorted(
+        report_rows,
+        key=lambda row: (
+            row["accounting_date"],
+            row["location_code"],
+            row["tank_asset_code"] or "",
+            row["product_name"] or "",
+        ),
+    )
+
+
+def consolidate_dynamic_material_balance_rows_by_location(
+    tank_rows: list[dict],
+    columns: list[MaterialBalanceTemplateColumn],
+):
+    consolidated_map = {}
+
+    for row in tank_rows:
+        key = (
+            row["accounting_date"],
+            row["location_code"],
+            row["product_name"] or "",
+        )
+
+        if key not in consolidated_map:
+            consolidated_map[key] = {
+                "accounting_date": row["accounting_date"],
+                "location_code": row["location_code"],
+                "location_name": row["location_name"],
+                "tank_asset_code": None,
+                "tank_asset_name": "All Tanks",
+                "product_name": row["product_name"],
+                "values": {},
+                "rows_count": 0,
+                "last_ticket_number": None,
+            }
+
+            for column in columns:
+                consolidated_map[key]["values"][column.column_key] = 0
+
+        target = consolidated_map[key]
+
+        for column in columns:
+            column_key = column.column_key
+            target["values"][column_key] = safe_float(
+                target["values"].get(column_key)
+            ) + safe_float(row["values"].get(column_key))
+
+        target["rows_count"] += int(row.get("rows_count") or 0)
+
+        if row.get("last_ticket_number"):
+            target["last_ticket_number"] = row.get("last_ticket_number")
+
+    consolidated_rows = []
+
+    for row in consolidated_map.values():
+        for column in columns:
+            column_key = column.column_key
+            row["values"][column_key] = round(
+                safe_float(row["values"].get(column_key)),
+                3,
+            )
+
+        consolidated_rows.append(row)
+
+    return sorted(
+        consolidated_rows,
+        key=lambda row: (
+            row["accounting_date"],
+            row["location_code"],
+            row["product_name"] or "",
+        ),
+    )
+
 @app.get(
     "/tank-stock-ledger",
     response_model=list[TankStockLedgerResponse],
@@ -6195,6 +7340,98 @@ def validate_out_turn_report_tank_sequence(
         "groups_checked": len(grouped_rows),
         "issues_count": len(issues),
         "issues": issues,
+    }
+
+@app.get(
+    "/material-balance-report",
+    response_model=MaterialBalanceDynamicReportResponse,
+)
+def get_material_balance_report(
+    location_code: str | None = None,
+    tank_asset_code: str | None = None,
+    product_name: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    unit: str | None = "nsv",
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Material Balance Report",
+        db,
+    )
+
+    cleaned_location_code = clean_optional_text(location_code)
+
+    if not cleaned_location_code:
+        raise HTTPException(
+            status_code=400,
+            detail="Location is required for configurable Material Balance Report",
+        )
+
+    date_from_value = parse_date_filter(date_from, "Date From")
+    date_to_value = parse_date_filter(date_to, "Date To")
+
+    if date_from_value is None or date_to_value is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Date From and Date To are required for Material Balance Report",
+        )
+
+    unit_key = normalize_material_balance_code_value(unit).lower()
+
+    if unit_key not in ["gsv", "nsv", "lt", "mt"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Unit must be one of: gsv, nsv, lt, mt",
+        )
+
+    template = get_active_material_balance_template_for_location(
+        db=db,
+        location_code=cleaned_location_code,
+    )
+
+    columns = get_active_material_balance_template_columns(
+        db=db,
+        template_id=template.id,
+    )
+
+    ledger_rows = get_material_balance_rows_for_continuity(
+        db=db,
+        location_code=cleaned_location_code,
+        tank_asset_code=tank_asset_code,
+        product_name=product_name,
+        date_to_value=date_to_value,
+    )
+
+    tank_rows = build_dynamic_material_balance_tank_rows(
+        db=db,
+        ledger_rows=ledger_rows,
+        columns=columns,
+        date_from_value=date_from_value,
+        date_to_value=date_to_value,
+        unit_key=unit_key,
+    )
+
+    cleaned_tank_asset_code = clean_optional_text(tank_asset_code)
+
+    if cleaned_tank_asset_code:
+        report_rows = tank_rows
+    else:
+        report_rows = consolidate_dynamic_material_balance_rows_by_location(
+            tank_rows=tank_rows,
+            columns=columns,
+        )
+
+    return {
+        "template": {
+            "id": template.id,
+            "location_code": template.location_code,
+            "template_name": template.template_name,
+        },
+        "columns": build_dynamic_material_balance_columns_response(columns),
+        "rows": report_rows,
     }
 
 @app.post("/tank-stock-ledger/rebuild")
@@ -11124,6 +12361,714 @@ def clear_table11_factors(
         "message": "Table 11 factors cleared successfully",
         "deleted_count": deleted_count,
     }
+
+# -------------------------
+# Material Balance Template Configuration Helpers
+# -------------------------
+
+VALID_MATERIAL_BALANCE_COLUMN_TYPES = {
+    "OPENING",
+    "MOVEMENT",
+    "BOOK_CLOSING",
+    "ACTUAL_CLOSING",
+    "LOSS_GAIN",
+    "FORMULA",
+    "INFO",
+}
+
+VALID_MATERIAL_BALANCE_DIRECTIONS = {
+    "IN",
+    "OUT",
+    "NEUTRAL",
+}
+
+
+def normalize_column_key(value: str):
+    cleaned_value = clean_optional_text(value)
+
+    if not cleaned_value:
+        return ""
+
+    normalized = cleaned_value.strip().lower()
+    normalized = normalized.replace(" ", "_")
+    normalized = normalized.replace("-", "_")
+    normalized = normalized.replace("/", "_")
+
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+
+    return normalized.upper()
+
+
+def validate_yes_no(value: str | None, field_name: str):
+    cleaned_value = clean_optional_text(value) or "No"
+    cleaned_value = cleaned_value.strip().title()
+
+    if cleaned_value not in ["Yes", "No"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be Yes or No",
+        )
+
+    return cleaned_value
+
+
+def validate_material_balance_template_column_payload(column):
+    column_type = clean_optional_text(column.column_type).upper()
+
+    if column_type not in VALID_MATERIAL_BALANCE_COLUMN_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Column Type must be one of: "
+                + ", ".join(sorted(VALID_MATERIAL_BALANCE_COLUMN_TYPES))
+            ),
+        )
+
+    movement_direction = clean_optional_text(column.movement_direction)
+
+    if column_type == "MOVEMENT":
+        if not movement_direction:
+            raise HTTPException(
+                status_code=400,
+                detail="Movement Direction is required for MOVEMENT columns",
+            )
+
+        movement_direction = movement_direction.upper()
+
+        if movement_direction not in VALID_MATERIAL_BALANCE_DIRECTIONS:
+            raise HTTPException(
+                status_code=400,
+                detail="Movement Direction must be IN, OUT, or NEUTRAL",
+            )
+
+        if len(column.mapped_operation_codes or []) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one Tank Operation must be mapped for MOVEMENT columns",
+            )
+    else:
+        movement_direction = None
+
+    include_in_material_balance = validate_yes_no(
+        column.include_in_material_balance,
+        "Include in Material Balance",
+    )
+
+    include_in_book_closing = validate_yes_no(
+        column.include_in_book_closing,
+        "Include in Book Closing",
+    )
+
+    is_internal_transfer = validate_yes_no(
+        column.is_internal_transfer,
+        "Is Internal Transfer",
+    )
+
+    # Safety rule:
+    # Internal transfer columns should not affect Material Balance or Book Closing.
+    if is_internal_transfer == "Yes":
+        include_in_material_balance = "No"
+        include_in_book_closing = "No"
+
+    column_key = normalize_column_key(column.column_key or column.column_label)
+
+    if not column_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Column Key is required",
+        )
+
+    mapped_operation_codes = [
+        normalize_column_key(item)
+        for item in (column.mapped_operation_codes or [])
+        if clean_optional_text(item)
+    ]
+
+    excluded_operation_codes = [
+        normalize_column_key(item)
+        for item in (column.excluded_operation_codes or [])
+        if clean_optional_text(item)
+    ]
+
+    return {
+        "column_key": column_key,
+        "column_type": column_type,
+        "movement_direction": movement_direction,
+        "mapped_operation_codes": mapped_operation_codes,
+        "excluded_operation_codes": excluded_operation_codes,
+        "include_in_material_balance": include_in_material_balance,
+        "include_in_book_closing": include_in_book_closing,
+        "is_internal_transfer": is_internal_transfer,
+    }
+
+
+def build_material_balance_template_response(
+    template: MaterialBalanceTemplate,
+):
+    return {
+        "id": template.id,
+        "location_code": template.location_code,
+        "template_name": template.template_name,
+        "description": template.description,
+        "status": template.status,
+        "created_at": template.created_at,
+        "updated_at": template.updated_at,
+    }
+
+
+def build_material_balance_template_column_response(
+    column: MaterialBalanceTemplateColumn,
+):
+    return {
+        "id": column.id,
+        "template_id": column.template_id,
+        "column_label": column.column_label,
+        "column_key": column.column_key,
+        "column_order": column.column_order,
+        "column_type": column.column_type,
+        "movement_direction": column.movement_direction,
+        "mapped_operation_codes": column.mapped_operation_codes or [],
+        "excluded_operation_codes": column.excluded_operation_codes or [],
+        "include_in_material_balance": column.include_in_material_balance,
+        "include_in_book_closing": column.include_in_book_closing,
+        "is_internal_transfer": column.is_internal_transfer,
+        "formula_json": column.formula_json,
+        "remarks": column.remarks,
+        "status": column.status,
+        "created_at": column.created_at,
+        "updated_at": column.updated_at,
+    }
+
+
+def build_material_balance_template_detail_response(
+    template: MaterialBalanceTemplate,
+    db: Session,
+):
+    columns = (
+        db.query(MaterialBalanceTemplateColumn)
+        .filter(MaterialBalanceTemplateColumn.template_id == template.id)
+        .order_by(
+            MaterialBalanceTemplateColumn.column_order.asc(),
+            MaterialBalanceTemplateColumn.id.asc(),
+        )
+        .all()
+    )
+
+    response = build_material_balance_template_response(template)
+    response["columns"] = [
+        build_material_balance_template_column_response(column)
+        for column in columns
+    ]
+
+    return response
+
+# -------------------------
+# Material Balance Template Configuration APIs
+# -------------------------
+
+@app.get(
+    "/material-balance-templates",
+    response_model=list[MaterialBalanceTemplateResponse],
+)
+def get_material_balance_templates(
+    location_code: str | None = None,
+    status: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Material Balance Template",
+        db,
+    )
+
+    query = db.query(MaterialBalanceTemplate)
+
+    cleaned_location_code = clean_optional_text(location_code)
+    cleaned_status = clean_optional_text(status)
+
+    if cleaned_location_code:
+        query = query.filter(
+            MaterialBalanceTemplate.location_code.ilike(cleaned_location_code)
+        )
+
+    if cleaned_status:
+        query = query.filter(MaterialBalanceTemplate.status == cleaned_status)
+
+    templates = (
+        query.order_by(
+            MaterialBalanceTemplate.location_code.asc(),
+            MaterialBalanceTemplate.template_name.asc(),
+        )
+        .all()
+    )
+
+    return [
+        build_material_balance_template_response(template)
+        for template in templates
+    ]
+
+
+@app.get(
+    "/material-balance-templates/{template_id}",
+    response_model=MaterialBalanceTemplateDetailResponse,
+)
+def get_material_balance_template_detail(
+    template_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Material Balance Template",
+        db,
+    )
+
+    template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(MaterialBalanceTemplate.id == template_id)
+        .first()
+    )
+
+    if not template:
+        raise HTTPException(
+            status_code=404,
+            detail="Material Balance Template not found",
+        )
+
+    return build_material_balance_template_detail_response(template, db)
+
+
+@app.post(
+    "/material-balance-templates",
+    response_model=MaterialBalanceTemplateResponse,
+)
+def create_material_balance_template(
+    template_data: MaterialBalanceTemplateCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Material Balance Template",
+        db,
+    )
+
+    location_code = clean_optional_text(template_data.location_code)
+
+    if not location_code:
+        raise HTTPException(
+            status_code=400,
+            detail="Location is required",
+        )
+
+    location = get_location_by_code(location_code, db)
+
+    if not location:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Location {location_code} not found",
+        )
+
+    template_name = clean_optional_text(template_data.template_name)
+
+    if not template_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Template Name is required",
+        )
+
+    existing_template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(
+            MaterialBalanceTemplate.location_code.ilike(location_code),
+            MaterialBalanceTemplate.template_name.ilike(template_name),
+        )
+        .first()
+    )
+
+    if existing_template:
+        raise HTTPException(
+            status_code=400,
+            detail="Material Balance Template already exists for this location",
+        )
+
+    new_template = MaterialBalanceTemplate(
+        location_code=location_code.upper(),
+        template_name=template_name,
+        description=clean_optional_text(template_data.description),
+        status=template_data.status or "Active",
+    )
+
+    db.add(new_template)
+    db.flush()
+
+    create_audit_log(
+        db=db,
+        module_name="Material Balance Template",
+        action="Create Material Balance Template",
+        current_user=current_user,
+        entity_type="MaterialBalanceTemplate",
+        entity_id=new_template.id,
+        entity_label=new_template.template_name,
+        remarks="Created Material Balance Template",
+        request_path="/material-balance-templates",
+        details=build_material_balance_template_response(new_template),
+    )
+
+    db.commit()
+    db.refresh(new_template)
+
+    return build_material_balance_template_response(new_template)
+
+
+@app.put(
+    "/material-balance-templates/{template_id}",
+    response_model=MaterialBalanceTemplateResponse,
+)
+def update_material_balance_template(
+    template_id: int,
+    template_data: MaterialBalanceTemplateUpdate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Material Balance Template",
+        db,
+    )
+
+    template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(MaterialBalanceTemplate.id == template_id)
+        .first()
+    )
+
+    if not template:
+        raise HTTPException(
+            status_code=404,
+            detail="Material Balance Template not found",
+        )
+
+    location_code = clean_optional_text(template_data.location_code)
+    template_name = clean_optional_text(template_data.template_name)
+
+    if not location_code:
+        raise HTTPException(status_code=400, detail="Location is required")
+
+    if not template_name:
+        raise HTTPException(status_code=400, detail="Template Name is required")
+
+    duplicate_template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(
+            MaterialBalanceTemplate.id != template_id,
+            MaterialBalanceTemplate.location_code.ilike(location_code),
+            MaterialBalanceTemplate.template_name.ilike(template_name),
+        )
+        .first()
+    )
+
+    if duplicate_template:
+        raise HTTPException(
+            status_code=400,
+            detail="Another Material Balance Template already exists for this location",
+        )
+
+    old_details = build_material_balance_template_response(template)
+
+    template.location_code = location_code.upper()
+    template.template_name = template_name
+    template.description = clean_optional_text(template_data.description)
+    template.status = template_data.status or "Active"
+    template.updated_at = datetime.now()
+
+    db.flush()
+
+    create_audit_log(
+        db=db,
+        module_name="Material Balance Template",
+        action="Update Material Balance Template",
+        current_user=current_user,
+        entity_type="MaterialBalanceTemplate",
+        entity_id=template.id,
+        entity_label=template.template_name,
+        remarks="Updated Material Balance Template",
+        request_path=f"/material-balance-templates/{template_id}",
+        details={
+            "old": old_details,
+            "new": build_material_balance_template_response(template),
+        },
+    )
+
+    db.commit()
+    db.refresh(template)
+
+    return build_material_balance_template_response(template)
+
+
+@app.delete("/material-balance-templates/{template_id}")
+def delete_material_balance_template(
+    template_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Material Balance Template",
+        db,
+    )
+
+    template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(MaterialBalanceTemplate.id == template_id)
+        .first()
+    )
+
+    if not template:
+        raise HTTPException(
+            status_code=404,
+            detail="Material Balance Template not found",
+        )
+
+    old_details = build_material_balance_template_detail_response(template, db)
+
+    db.delete(template)
+
+    create_audit_log(
+        db=db,
+        module_name="Material Balance Template",
+        action="Delete Material Balance Template",
+        current_user=current_user,
+        entity_type="MaterialBalanceTemplate",
+        entity_id=template_id,
+        entity_label=template.template_name,
+        remarks="Deleted Material Balance Template",
+        request_path=f"/material-balance-templates/{template_id}",
+        details=old_details,
+    )
+
+    db.commit()
+
+    return {"message": "Material Balance Template deleted successfully"}
+
+
+@app.post(
+    "/material-balance-templates/{template_id}/columns",
+    response_model=MaterialBalanceTemplateColumnResponse,
+)
+def create_material_balance_template_column(
+    template_id: int,
+    column_data: MaterialBalanceTemplateColumnCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Material Balance Template",
+        db,
+    )
+
+    template = (
+        db.query(MaterialBalanceTemplate)
+        .filter(MaterialBalanceTemplate.id == template_id)
+        .first()
+    )
+
+    if not template:
+        raise HTTPException(
+            status_code=404,
+            detail="Material Balance Template not found",
+        )
+
+    validated = validate_material_balance_template_column_payload(column_data)
+
+    duplicate_column = (
+        db.query(MaterialBalanceTemplateColumn)
+        .filter(
+            MaterialBalanceTemplateColumn.template_id == template_id,
+            MaterialBalanceTemplateColumn.column_key == validated["column_key"],
+        )
+        .first()
+    )
+
+    if duplicate_column:
+        raise HTTPException(
+            status_code=400,
+            detail="Column Key already exists in this template",
+        )
+
+    new_column = MaterialBalanceTemplateColumn(
+        template_id=template_id,
+        column_label=clean_optional_text(column_data.column_label),
+        column_key=validated["column_key"],
+        column_order=column_data.column_order or 1,
+        column_type=validated["column_type"],
+        movement_direction=validated["movement_direction"],
+        mapped_operation_codes=validated["mapped_operation_codes"],
+        excluded_operation_codes=validated["excluded_operation_codes"],
+        include_in_material_balance=validated["include_in_material_balance"],
+        include_in_book_closing=validated["include_in_book_closing"],
+        is_internal_transfer=validated["is_internal_transfer"],
+        formula_json=column_data.formula_json,
+        remarks=clean_optional_text(column_data.remarks),
+        status=column_data.status or "Active",
+    )
+
+    db.add(new_column)
+    db.flush()
+
+    create_audit_log(
+        db=db,
+        module_name="Material Balance Template",
+        action="Create Material Balance Template Column",
+        current_user=current_user,
+        entity_type="MaterialBalanceTemplateColumn",
+        entity_id=new_column.id,
+        entity_label=new_column.column_label,
+        remarks="Created Material Balance Template Column",
+        request_path=f"/material-balance-templates/{template_id}/columns",
+        details=build_material_balance_template_column_response(new_column),
+    )
+
+    db.commit()
+    db.refresh(new_column)
+
+    return build_material_balance_template_column_response(new_column)
+
+
+@app.put(
+    "/material-balance-template-columns/{column_id}",
+    response_model=MaterialBalanceTemplateColumnResponse,
+)
+def update_material_balance_template_column(
+    column_id: int,
+    column_data: MaterialBalanceTemplateColumnUpdate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Material Balance Template",
+        db,
+    )
+
+    column = (
+        db.query(MaterialBalanceTemplateColumn)
+        .filter(MaterialBalanceTemplateColumn.id == column_id)
+        .first()
+    )
+
+    if not column:
+        raise HTTPException(
+            status_code=404,
+            detail="Material Balance Template Column not found",
+        )
+
+    validated = validate_material_balance_template_column_payload(column_data)
+
+    duplicate_column = (
+        db.query(MaterialBalanceTemplateColumn)
+        .filter(
+            MaterialBalanceTemplateColumn.id != column_id,
+            MaterialBalanceTemplateColumn.template_id == column.template_id,
+            MaterialBalanceTemplateColumn.column_key == validated["column_key"],
+        )
+        .first()
+    )
+
+    if duplicate_column:
+        raise HTTPException(
+            status_code=400,
+            detail="Column Key already exists in this template",
+        )
+
+    old_details = build_material_balance_template_column_response(column)
+
+    column.column_label = clean_optional_text(column_data.column_label)
+    column.column_key = validated["column_key"]
+    column.column_order = column_data.column_order or 1
+    column.column_type = validated["column_type"]
+    column.movement_direction = validated["movement_direction"]
+    column.mapped_operation_codes = validated["mapped_operation_codes"]
+    column.excluded_operation_codes = validated["excluded_operation_codes"]
+    column.include_in_material_balance = validated["include_in_material_balance"]
+    column.include_in_book_closing = validated["include_in_book_closing"]
+    column.is_internal_transfer = validated["is_internal_transfer"]
+    column.formula_json = column_data.formula_json
+    column.remarks = clean_optional_text(column_data.remarks)
+    column.status = column_data.status or "Active"
+    column.updated_at = datetime.now()
+
+    db.flush()
+
+    create_audit_log(
+        db=db,
+        module_name="Material Balance Template",
+        action="Update Material Balance Template Column",
+        current_user=current_user,
+        entity_type="MaterialBalanceTemplateColumn",
+        entity_id=column.id,
+        entity_label=column.column_label,
+        remarks="Updated Material Balance Template Column",
+        request_path=f"/material-balance-template-columns/{column_id}",
+        details={
+            "old": old_details,
+            "new": build_material_balance_template_column_response(column),
+        },
+    )
+
+    db.commit()
+    db.refresh(column)
+
+    return build_material_balance_template_column_response(column)
+
+
+@app.delete("/material-balance-template-columns/{column_id}")
+def delete_material_balance_template_column(
+    column_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Material Balance Template",
+        db,
+    )
+
+    column = (
+        db.query(MaterialBalanceTemplateColumn)
+        .filter(MaterialBalanceTemplateColumn.id == column_id)
+        .first()
+    )
+
+    if not column:
+        raise HTTPException(
+            status_code=404,
+            detail="Material Balance Template Column not found",
+        )
+
+    old_details = build_material_balance_template_column_response(column)
+
+    db.delete(column)
+
+    create_audit_log(
+        db=db,
+        module_name="Material Balance Template",
+        action="Delete Material Balance Template Column",
+        current_user=current_user,
+        entity_type="MaterialBalanceTemplateColumn",
+        entity_id=column_id,
+        entity_label=column.column_label,
+        remarks="Deleted Material Balance Template Column",
+        request_path=f"/material-balance-template-columns/{column_id}",
+        details=old_details,
+    )
+
+    db.commit()
+
+    return {"message": "Material Balance Template Column deleted successfully"}
 
 # -------------------------
 # Company Report Profile APIs
