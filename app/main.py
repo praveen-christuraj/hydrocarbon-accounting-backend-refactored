@@ -35,6 +35,7 @@ from app.database import Base, engine, get_db
 from app.models import (
     Asset,
     AssetAssignment,
+    PrimeMoverTankerLink,
     AssetCalibrationData,
     AssetCalibrationTable,
     AssetType,
@@ -70,6 +71,9 @@ from app.models import (
 from app.schemas import (
     AssetAssignmentCreate,
     AssetAssignmentResponse,
+    PrimeMoverTankerLinkCreate,
+    PrimeMoverTankerLinkResponse,
+    CurrentPrimeMoverTankerLinkResponse,
     AssetCalibrationTableCreate,
     AssetCalibrationTableResponse,
     AssetCreate,
@@ -86,6 +90,7 @@ from app.schemas import (
     LocationOperationAvailabilityResponse,
     OperationEntryCreate,
     OperationEntryResponse,
+    TankerTransactionReportResponse,
     OperationTemplateCreate,
     OperationTemplateResponse,
     OperationTransactionCreate,
@@ -4582,6 +4587,655 @@ def delete_asset_assignment(
         "message": "Asset assignment deleted successfully"
     }
 
+
+# -------------------------
+# Prime Mover - Tanker Link APIs
+# -------------------------
+
+def get_asset_by_code_case_insensitive(
+    asset_code: str | None,
+    db: Session,
+):
+    cleaned_asset_code = clean_optional_text(asset_code)
+
+    if not cleaned_asset_code:
+        return None
+
+    return (
+        db.query(Asset)
+        .filter(Asset.asset_code.ilike(cleaned_asset_code))
+        .first()
+    )
+
+
+def is_prime_mover_asset(asset: Asset | None):
+    if not asset:
+        return False
+
+    asset_type_code = str(asset.asset_type_code or "").strip().upper()
+    asset_name = str(asset.asset_name or "").strip().upper()
+    asset_code = str(asset.asset_code or "").strip().upper()
+
+    return (
+        "PRIME" in asset_type_code
+        or "MOVER" in asset_type_code
+        or "PRIME" in asset_name
+        or "MOVER" in asset_name
+        or asset_code.startswith("PM")
+    )
+
+
+def is_tanker_trailer_asset(asset: Asset | None):
+    if not asset:
+        return False
+
+    asset_type_code = str(asset.asset_type_code or "").strip().upper()
+    asset_name = str(asset.asset_name or "").strip().upper()
+
+    return (
+        "TANKER" in asset_type_code
+        or "TRAILER" in asset_type_code
+        or "TRUCK" in asset_type_code
+        or "TANKER" in asset_name
+        or "TRAILER" in asset_name
+    )
+
+
+def build_prime_mover_tanker_link_response(
+    link: PrimeMoverTankerLink,
+    db: Session,
+):
+    prime_mover_asset = get_asset_by_code_case_insensitive(
+        link.prime_mover_asset_code,
+        db,
+    )
+
+    tanker_asset = get_asset_by_code_case_insensitive(
+        link.tanker_asset_code,
+        db,
+    )
+
+    return {
+        "id": link.id,
+        "prime_mover_asset_code": link.prime_mover_asset_code,
+        "prime_mover_asset_name": prime_mover_asset.asset_name
+        if prime_mover_asset
+        else "",
+        "prime_mover_asset_type_code": prime_mover_asset.asset_type_code
+        if prime_mover_asset
+        else "",
+        "tanker_asset_code": link.tanker_asset_code,
+        "tanker_asset_name": tanker_asset.asset_name if tanker_asset else "",
+        "tanker_asset_type_code": tanker_asset.asset_type_code
+        if tanker_asset
+        else "",
+        "tanker_chassis_number": tanker_asset.serial_number
+        if tanker_asset
+        else "",
+        "linked_from": link.linked_from,
+        "linked_to": link.linked_to,
+        "remarks": link.remarks,
+        "status": link.status,
+        "created_by": link.created_by,
+        "created_at": link.created_at,
+        "updated_at": link.updated_at,
+    }
+
+
+def build_prime_mover_tanker_link_audit_snapshot(
+    link: PrimeMoverTankerLink,
+    db: Session,
+):
+    return build_prime_mover_tanker_link_response(link, db)
+
+
+def validate_prime_mover_tanker_link(
+    link_request: PrimeMoverTankerLinkCreate,
+    db: Session,
+    link_id: int | None = None,
+):
+    prime_mover_asset_code = str(
+        link_request.prime_mover_asset_code or ""
+    ).strip()
+
+    tanker_asset_code = str(
+        link_request.tanker_asset_code or ""
+    ).strip()
+
+    if prime_mover_asset_code == "":
+        raise HTTPException(
+            status_code=400,
+            detail="Prime Mover asset is required",
+        )
+
+    if tanker_asset_code == "":
+        raise HTTPException(
+            status_code=400,
+            detail="Tanker Trailer asset is required",
+        )
+
+    if prime_mover_asset_code.lower() == tanker_asset_code.lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Prime Mover and Tanker Trailer cannot be the same asset",
+        )
+
+    prime_mover_asset = get_asset_by_code_case_insensitive(
+        prime_mover_asset_code,
+        db,
+    )
+
+    if not prime_mover_asset:
+        raise HTTPException(
+            status_code=400,
+            detail="Prime Mover asset not found",
+        )
+
+    if prime_mover_asset.status != "Active":
+        raise HTTPException(
+            status_code=400,
+            detail="Only Active Prime Mover asset can be linked",
+        )
+
+    if not is_prime_mover_asset(prime_mover_asset):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected Prime Mover asset does not look like a Prime Mover. "
+                "Use asset type code such as PRIME_MOVER."
+            ),
+        )
+
+    tanker_asset = get_asset_by_code_case_insensitive(
+        tanker_asset_code,
+        db,
+    )
+
+    if not tanker_asset:
+        raise HTTPException(
+            status_code=400,
+            detail="Tanker Trailer asset not found",
+        )
+
+    if tanker_asset.status != "Active":
+        raise HTTPException(
+            status_code=400,
+            detail="Only Active Tanker Trailer asset can be linked",
+        )
+
+    if not is_tanker_trailer_asset(tanker_asset):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected Tanker asset does not look like a Tanker Trailer. "
+                "Use asset type code such as TANKER_TRAILER."
+            ),
+        )
+
+    if link_request.linked_to is not None:
+        if link_request.linked_to < link_request.linked_from:
+            raise HTTPException(
+                status_code=400,
+                detail="Linked To cannot be earlier than Linked From",
+            )
+
+    cleaned_status = str(link_request.status or "").strip()
+
+    if cleaned_status not in ["Active", "Inactive"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be Active or Inactive",
+        )
+
+    # Active link rule:
+    # 1 Prime Mover can have only 1 Active Tanker.
+    # 1 Tanker Trailer can have only 1 Active Prime Mover.
+    if cleaned_status == "Active":
+        active_prime_mover_link_query = (
+            db.query(PrimeMoverTankerLink)
+            .filter(
+                PrimeMoverTankerLink.prime_mover_asset_code.ilike(
+                    prime_mover_asset_code
+                ),
+                PrimeMoverTankerLink.status == "Active",
+            )
+        )
+
+        active_tanker_link_query = (
+            db.query(PrimeMoverTankerLink)
+            .filter(
+                PrimeMoverTankerLink.tanker_asset_code.ilike(
+                    tanker_asset_code
+                ),
+                PrimeMoverTankerLink.status == "Active",
+            )
+        )
+
+        if link_id is not None:
+            active_prime_mover_link_query = active_prime_mover_link_query.filter(
+                PrimeMoverTankerLink.id != link_id
+            )
+
+            active_tanker_link_query = active_tanker_link_query.filter(
+                PrimeMoverTankerLink.id != link_id
+            )
+
+        active_prime_mover_link = active_prime_mover_link_query.first()
+
+        if active_prime_mover_link:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This Prime Mover already has an Active Tanker link. "
+                    "Close or deactivate the old link before creating a new one."
+                ),
+            )
+
+        active_tanker_link = active_tanker_link_query.first()
+
+        if active_tanker_link:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This Tanker Trailer is already linked to another Active "
+                    "Prime Mover. Close or deactivate the old link first."
+                ),
+            )
+
+    return {
+        "prime_mover_asset_code": prime_mover_asset.asset_code,
+        "tanker_asset_code": tanker_asset.asset_code,
+        "linked_from": link_request.linked_from,
+        "linked_to": link_request.linked_to,
+        "remarks": clean_optional_text(link_request.remarks),
+        "status": cleaned_status,
+    }
+
+
+@app.get(
+    "/prime-mover-tanker-links",
+    response_model=list[PrimeMoverTankerLinkResponse],
+)
+def get_prime_mover_tanker_links(
+    status: str | None = None,
+    prime_mover_asset_code: str | None = None,
+    tanker_asset_code: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Asset",
+        db,
+    )
+
+    query = db.query(PrimeMoverTankerLink)
+
+    cleaned_status = clean_optional_text(status)
+
+    if cleaned_status:
+        query = query.filter(PrimeMoverTankerLink.status == cleaned_status)
+
+    cleaned_prime_mover_asset_code = clean_optional_text(prime_mover_asset_code)
+
+    if cleaned_prime_mover_asset_code:
+        query = query.filter(
+            PrimeMoverTankerLink.prime_mover_asset_code.ilike(
+                cleaned_prime_mover_asset_code
+            )
+        )
+
+    cleaned_tanker_asset_code = clean_optional_text(tanker_asset_code)
+
+    if cleaned_tanker_asset_code:
+        query = query.filter(
+            PrimeMoverTankerLink.tanker_asset_code.ilike(
+                cleaned_tanker_asset_code
+            )
+        )
+
+    links = (
+        query.order_by(
+            PrimeMoverTankerLink.status.asc(),
+            PrimeMoverTankerLink.linked_from.desc(),
+            PrimeMoverTankerLink.id.desc(),
+        )
+        .all()
+    )
+
+    return [
+        build_prime_mover_tanker_link_response(link, db)
+        for link in links
+    ]
+
+
+@app.get(
+    "/prime-mover-tanker-links/current-by-prime-mover/{prime_mover_asset_code}",
+    response_model=CurrentPrimeMoverTankerLinkResponse,
+)
+def get_current_prime_mover_tanker_link(
+    prime_mover_asset_code: str,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Asset",
+        db,
+    )
+
+    link = (
+        db.query(PrimeMoverTankerLink)
+        .filter(
+            PrimeMoverTankerLink.prime_mover_asset_code.ilike(
+                prime_mover_asset_code
+            ),
+            PrimeMoverTankerLink.status == "Active",
+        )
+        .order_by(
+            PrimeMoverTankerLink.linked_from.desc(),
+            PrimeMoverTankerLink.id.desc(),
+        )
+        .first()
+    )
+
+    if not link:
+        return {
+            "has_active_link": False,
+            "link": None,
+        }
+
+    return {
+        "has_active_link": True,
+        "link": build_prime_mover_tanker_link_response(link, db),
+    }
+
+
+@app.post(
+    "/prime-mover-tanker-links",
+    response_model=PrimeMoverTankerLinkResponse,
+)
+def create_prime_mover_tanker_link(
+    link_request: PrimeMoverTankerLinkCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Asset",
+        db,
+    )
+
+    validated_data = validate_prime_mover_tanker_link(
+        link_request,
+        db,
+    )
+
+    new_link = PrimeMoverTankerLink(
+        prime_mover_asset_code=validated_data["prime_mover_asset_code"],
+        tanker_asset_code=validated_data["tanker_asset_code"],
+        linked_from=validated_data["linked_from"],
+        linked_to=validated_data["linked_to"],
+        remarks=validated_data["remarks"],
+        status=validated_data["status"],
+        created_by=get_current_user_display_name(current_user),
+    )
+
+    db.add(new_link)
+    db.flush()
+
+    after_data = build_prime_mover_tanker_link_audit_snapshot(
+        new_link,
+        db,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Prime Mover Tanker Link",
+        action="Create Prime Mover Tanker Link",
+        current_user=current_user,
+        entity_type="PrimeMoverTankerLink",
+        entity_id=new_link.id,
+        entity_label=(
+            f"{new_link.prime_mover_asset_code} -> "
+            f"{new_link.tanker_asset_code}"
+        ),
+        remarks="Prime mover tanker link created",
+        request_path="/prime-mover-tanker-links",
+        details={
+            "after": after_data,
+        },
+    )
+
+    db.commit()
+    db.refresh(new_link)
+
+    return build_prime_mover_tanker_link_response(new_link, db)
+
+
+@app.put(
+    "/prime-mover-tanker-links/{link_id}",
+    response_model=PrimeMoverTankerLinkResponse,
+)
+def update_prime_mover_tanker_link(
+    link_id: int,
+    link_request: PrimeMoverTankerLinkCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Asset",
+        db,
+    )
+
+    existing_link = (
+        db.query(PrimeMoverTankerLink)
+        .filter(PrimeMoverTankerLink.id == link_id)
+        .first()
+    )
+
+    if not existing_link:
+        raise HTTPException(
+            status_code=404,
+            detail="Prime Mover Tanker link not found",
+        )
+
+    before_data = build_prime_mover_tanker_link_audit_snapshot(
+        existing_link,
+        db,
+    )
+
+    validated_data = validate_prime_mover_tanker_link(
+        link_request,
+        db,
+        link_id=link_id,
+    )
+
+    existing_link.prime_mover_asset_code = validated_data[
+        "prime_mover_asset_code"
+    ]
+    existing_link.tanker_asset_code = validated_data["tanker_asset_code"]
+    existing_link.linked_from = validated_data["linked_from"]
+    existing_link.linked_to = validated_data["linked_to"]
+    existing_link.remarks = validated_data["remarks"]
+    existing_link.status = validated_data["status"]
+    existing_link.updated_at = datetime.now()
+
+    db.flush()
+
+    after_data = build_prime_mover_tanker_link_audit_snapshot(
+        existing_link,
+        db,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Prime Mover Tanker Link",
+        action="Update Prime Mover Tanker Link",
+        current_user=current_user,
+        entity_type="PrimeMoverTankerLink",
+        entity_id=existing_link.id,
+        entity_label=(
+            f"{existing_link.prime_mover_asset_code} -> "
+            f"{existing_link.tanker_asset_code}"
+        ),
+        remarks="Prime mover tanker link updated",
+        request_path=f"/prime-mover-tanker-links/{link_id}",
+        details={
+            "before": before_data,
+            "after": after_data,
+        },
+    )
+
+    db.commit()
+    db.refresh(existing_link)
+
+    return build_prime_mover_tanker_link_response(existing_link, db)
+
+
+@app.post(
+    "/prime-mover-tanker-links/{link_id}/close",
+    response_model=PrimeMoverTankerLinkResponse,
+)
+def close_prime_mover_tanker_link(
+    link_id: int,
+    linked_to: date | None = None,
+    remarks: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Asset",
+        db,
+    )
+
+    existing_link = (
+        db.query(PrimeMoverTankerLink)
+        .filter(PrimeMoverTankerLink.id == link_id)
+        .first()
+    )
+
+    if not existing_link:
+        raise HTTPException(
+            status_code=404,
+            detail="Prime Mover Tanker link not found",
+        )
+
+    close_date = linked_to or date.today()
+
+    if close_date < existing_link.linked_from:
+        raise HTTPException(
+            status_code=400,
+            detail="Close date cannot be earlier than Linked From",
+        )
+
+    before_data = build_prime_mover_tanker_link_audit_snapshot(
+        existing_link,
+        db,
+    )
+
+    existing_link.linked_to = close_date
+    existing_link.status = "Inactive"
+
+    cleaned_remarks = clean_optional_text(remarks)
+
+    if cleaned_remarks:
+        if existing_link.remarks:
+            existing_link.remarks = (
+                f"{existing_link.remarks}\nClose Remarks: {cleaned_remarks}"
+            )
+        else:
+            existing_link.remarks = f"Close Remarks: {cleaned_remarks}"
+
+    existing_link.updated_at = datetime.now()
+
+    db.flush()
+
+    after_data = build_prime_mover_tanker_link_audit_snapshot(
+        existing_link,
+        db,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Prime Mover Tanker Link",
+        action="Close Prime Mover Tanker Link",
+        current_user=current_user,
+        entity_type="PrimeMoverTankerLink",
+        entity_id=existing_link.id,
+        entity_label=(
+            f"{existing_link.prime_mover_asset_code} -> "
+            f"{existing_link.tanker_asset_code}"
+        ),
+        remarks="Prime mover tanker link closed",
+        request_path=f"/prime-mover-tanker-links/{link_id}/close",
+        details={
+            "before": before_data,
+            "after": after_data,
+        },
+    )
+
+    db.commit()
+    db.refresh(existing_link)
+
+    return build_prime_mover_tanker_link_response(existing_link, db)
+
+
+@app.delete("/prime-mover-tanker-links/{link_id}")
+def delete_prime_mover_tanker_link(
+    link_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Manage Asset",
+        db,
+    )
+
+    existing_link = (
+        db.query(PrimeMoverTankerLink)
+        .filter(PrimeMoverTankerLink.id == link_id)
+        .first()
+    )
+
+    if not existing_link:
+        raise HTTPException(
+            status_code=404,
+            detail="Prime Mover Tanker link not found",
+        )
+
+    deleted_data = build_prime_mover_tanker_link_audit_snapshot(
+        existing_link,
+        db,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Prime Mover Tanker Link",
+        action="Delete Prime Mover Tanker Link",
+        current_user=current_user,
+        entity_type="PrimeMoverTankerLink",
+        entity_id=existing_link.id,
+        entity_label=(
+            f"{existing_link.prime_mover_asset_code} -> "
+            f"{existing_link.tanker_asset_code}"
+        ),
+        remarks="Prime mover tanker link deleted",
+        request_path=f"/prime-mover-tanker-links/{link_id}",
+        details={
+            "deleted": deleted_data,
+        },
+    )
+
+    db.delete(existing_link)
+    db.commit()
+
+    return {
+        "message": "Prime Mover Tanker link deleted successfully",
+    }
 
 # -------------------------
 # Operation Type APIs
@@ -9817,6 +10471,332 @@ def get_operation_transaction_detail(
         "created_at": transaction.created_at,
         "updated_at": transaction.updated_at,
         "field_values": field_values,
+    }
+
+# -------------------------
+# Tanker Transaction Report APIs
+# -------------------------
+
+def parse_json_field_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        return value
+
+    try:
+        import json
+        return json.loads(str(value))
+    except Exception:
+        return None
+
+
+def get_nested_value(data: dict, path: list[str], default=None):
+    current = data
+
+    for key in path:
+        if not isinstance(current, dict):
+            return default
+
+        current = current.get(key)
+
+        if current is None:
+            return default
+
+    return current
+
+
+def get_tanker_payload_for_transaction(
+    db: Session,
+    transaction_id: int,
+):
+    payload_row = (
+        db.query(OperationTransactionValue)
+        .filter(
+            OperationTransactionValue.transaction_id == transaction_id,
+            OperationTransactionValue.field_code == "tanker_payload",
+        )
+        .first()
+    )
+
+    if not payload_row:
+        return None
+
+    return parse_json_field_value(payload_row.field_value)
+
+
+def build_tanker_transaction_report_row(
+    transaction: OperationTransaction,
+    tanker_payload: dict,
+    db: Session,
+):
+    operation_type = get_operation_type_by_code(
+        transaction.operation_type_code,
+        db,
+    )
+
+    location = get_location_by_code(
+        transaction.origin_location_code,
+        db,
+    )
+
+    asset = get_asset_by_code(
+        transaction.primary_asset_code,
+        db,
+    )
+
+    inputs = tanker_payload.get("inputs") or {}
+    calculated = tanker_payload.get("calculated") or {}
+
+    def number_from_input(key: str):
+        return safe_float(inputs.get(key))
+
+    def number_from_calculated(*keys: str):
+        for key in keys:
+            value = calculated.get(key)
+            if value is not None:
+                return safe_float(value)
+        return 0
+
+    return {
+        "transaction_id": transaction.id,
+        "operation_number": transaction.operation_number,
+        "ticket_number": get_transaction_ticket_number(transaction),
+
+        "operation_date": transaction.operation_date,
+        "operation_start_datetime": transaction.operation_start_datetime,
+        "operation_end_datetime": transaction.operation_end_datetime,
+
+        "operation_type_code": transaction.operation_type_code,
+        "operation_type_name": operation_type.operation_type_name if operation_type else "",
+
+        "location_code": transaction.origin_location_code,
+        "location_name": location.location_name if location else "",
+
+        "asset_code": transaction.primary_asset_code,
+        "asset_name": asset.asset_name if asset else "",
+        "asset_type_code": transaction.primary_asset_type_code,
+
+        "convoy_number": transaction.convoy_number,
+        "tanker_name": inputs.get("tankerName") or (asset.asset_name if asset else ""),
+        "prime_mover_number": inputs.get("primeMoverNumber"),
+        "chassis_number": inputs.get("chassisNumber"),
+
+        "cargo": inputs.get("cargo") or transaction.product_name,
+        "tanker_operation": inputs.get("operation"),
+        "destination": inputs.get("destination"),
+        "loading_bay": inputs.get("loadingBay"),
+        "compartment": inputs.get("compartment"),
+
+        "total_dip_cm": number_from_input("totalDipCm"),
+        "water_dip_cm": number_from_input("waterDipCm"),
+        "bsw_percent": number_from_input("bswPercent"),
+
+        "tank_temperature": (
+            safe_float(inputs.get("tankTemperature"))
+            if inputs.get("tankTemperature") is not None
+            else None
+        ),
+        "tank_temperature_unit": inputs.get("tankTemperatureUnit"),
+        "sample_temperature": (
+            safe_float(inputs.get("sampleTemperature"))
+            if inputs.get("sampleTemperature") is not None
+            else None
+        ),
+        "sample_temperature_unit": inputs.get("sampleTemperatureUnit"),
+
+        "observed_input_type": inputs.get("observedInputType"),
+        "observed_api": (
+            safe_float(inputs.get("observedApi"))
+            if inputs.get("observedApi") is not None
+            else calculated.get("observedApi")
+        ),
+        "observed_density": (
+            safe_float(inputs.get("observedDensity"))
+            if inputs.get("observedDensity") is not None
+            else calculated.get("observedDensity")
+        ),
+        "api60": calculated.get("api60"),
+        "vcf": calculated.get("vcf"),
+
+        "tov_bbl": number_from_calculated("tovBbl", "totalVolumeBbl", "total_volume_bbl"),
+        "free_water_bbl": number_from_calculated("freeWaterBbl", "waterVolumeBbl", "water_volume_bbl"),
+        "gov_bbl": number_from_calculated("govBbl", "gov_bbl"),
+        "gsv_bbl": number_from_calculated("gsvBbl", "gsv_bbl"),
+        "bsw_bbl": number_from_calculated("bswBbl", "bsw_vol_bbl", "bswVolumeBbl"),
+        "nsv_bbl": number_from_calculated("nsvBbl", "nsv_bbl"),
+
+        "lt_factor": calculated.get("ltFactor"),
+        "lt": number_from_calculated("lt"),
+        "mt": number_from_calculated("mt"),
+
+        "seal_c1": inputs.get("sealC1"),
+        "seal_c2": inputs.get("sealC2"),
+        "seal_m1": inputs.get("sealM1"),
+        "seal_m2": inputs.get("sealM2"),
+
+        "remarks": inputs.get("remarks") or transaction.remarks,
+        "status": transaction.status,
+        "created_by": transaction.created_by,
+        "created_at": transaction.created_at,
+        "updated_at": transaction.updated_at,
+    }
+
+
+def get_filtered_tanker_transaction_report_rows(
+    db: Session,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    location_code: str | None = None,
+    asset_code: str | None = None,
+    convoy_number: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+):
+    query = db.query(OperationTransaction).join(
+        OperationTransactionValue,
+        OperationTransactionValue.transaction_id == OperationTransaction.id,
+    ).filter(
+        OperationTransactionValue.field_code == "tanker_payload",
+        OperationTransactionValue.field_value != None,
+    )
+
+    date_from_value = parse_date_filter(date_from, "Date From")
+    date_to_value = parse_date_filter(date_to, "Date To")
+
+    if date_from_value:
+        query = query.filter(OperationTransaction.operation_date >= date_from_value)
+
+    if date_to_value:
+        query = query.filter(OperationTransaction.operation_date <= date_to_value)
+
+    cleaned_location_code = clean_optional_text(location_code)
+    cleaned_asset_code = clean_optional_text(asset_code)
+    cleaned_convoy_number = clean_optional_text(convoy_number)
+    cleaned_status = clean_optional_text(status)
+
+    if cleaned_location_code:
+        query = query.filter(
+            OperationTransaction.origin_location_code.ilike(cleaned_location_code)
+        )
+
+    if cleaned_asset_code:
+        query = query.filter(
+            OperationTransaction.primary_asset_code.ilike(cleaned_asset_code)
+        )
+
+    if cleaned_convoy_number:
+        query = query.filter(
+            OperationTransaction.convoy_number.ilike(cleaned_convoy_number)
+        )
+
+    if cleaned_status:
+        query = query.filter(OperationTransaction.status == cleaned_status)
+
+    transactions = (
+        query.order_by(
+            OperationTransaction.operation_date.desc(),
+            OperationTransaction.id.desc(),
+        )
+        .all()
+    )
+
+    rows = []
+
+    for transaction in transactions:
+        tanker_payload = get_tanker_payload_for_transaction(db, transaction.id)
+
+        if not tanker_payload:
+            continue
+
+        row = build_tanker_transaction_report_row(
+            transaction=transaction,
+            tanker_payload=tanker_payload,
+            db=db,
+        )
+
+        cleaned_search = clean_optional_text(search)
+
+        if cleaned_search:
+            search_value = cleaned_search.lower()
+
+            searchable_text = " ".join(
+                [
+                    str(row.get("ticket_number") or ""),
+                    str(row.get("operation_number") or ""),
+                    str(row.get("operation_type_code") or ""),
+                    str(row.get("operation_type_name") or ""),
+                    str(row.get("location_code") or ""),
+                    str(row.get("location_name") or ""),
+                    str(row.get("asset_code") or ""),
+                    str(row.get("asset_name") or ""),
+                    str(row.get("convoy_number") or ""),
+                    str(row.get("tanker_name") or ""),
+                    str(row.get("prime_mover_number") or ""),
+                    str(row.get("chassis_number") or ""),
+                    str(row.get("destination") or ""),
+                    str(row.get("cargo") or ""),
+                    str(row.get("status") or ""),
+                ]
+            ).lower()
+
+            if search_value not in searchable_text:
+                continue
+
+        rows.append(row)
+
+    return rows
+
+
+def build_tanker_transaction_report_totals(rows: list[dict]):
+    return {
+        "rows_count": len(rows),
+        "total_tov_bbl": round(sum(safe_float(row.get("tov_bbl")) for row in rows), 3),
+        "total_free_water_bbl": round(sum(safe_float(row.get("free_water_bbl")) for row in rows), 3),
+        "total_gov_bbl": round(sum(safe_float(row.get("gov_bbl")) for row in rows), 3),
+        "total_gsv_bbl": round(sum(safe_float(row.get("gsv_bbl")) for row in rows), 3),
+        "total_bsw_bbl": round(sum(safe_float(row.get("bsw_bbl")) for row in rows), 3),
+        "total_nsv_bbl": round(sum(safe_float(row.get("nsv_bbl")) for row in rows), 3),
+        "total_lt": round(sum(safe_float(row.get("lt")) for row in rows), 3),
+        "total_mt": round(sum(safe_float(row.get("mt")) for row in rows), 3),
+    }
+
+
+@app.get(
+    "/tanker-transaction-report",
+    response_model=TankerTransactionReportResponse,
+)
+def get_tanker_transaction_report(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    location_code: str | None = None,
+    asset_code: str | None = None,
+    convoy_number: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "View Operation Transaction",
+        db,
+    )
+
+    rows = get_filtered_tanker_transaction_report_rows(
+        db=db,
+        date_from=date_from,
+        date_to=date_to,
+        location_code=location_code,
+        asset_code=asset_code,
+        convoy_number=convoy_number,
+        status=status,
+        search=search,
+    )
+
+    return {
+        "rows": rows,
+        "totals": build_tanker_transaction_report_totals(rows),
     }
 
 # -------------------------

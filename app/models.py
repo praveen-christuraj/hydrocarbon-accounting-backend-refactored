@@ -342,7 +342,30 @@ class AssetAssignment(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now())
 
+class PrimeMoverTankerLink(Base):
+    __tablename__ = "prime_mover_tanker_links"
 
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Prime mover / tractor head asset code.
+    # This is the operationally selected asset in Operation Entry.
+    prime_mover_asset_code = Column(String(80), nullable=False, index=True)
+
+    # Tanker trailer / tank body asset code.
+    # Calibration chart belongs to this asset.
+    tanker_asset_code = Column(String(80), nullable=False, index=True)
+
+    linked_from = Column(Date, nullable=False, index=True)
+    linked_to = Column(Date, nullable=True, index=True)
+
+    remarks = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="Active", index=True)
+
+    created_by = Column(String(150), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+    
 class OperationType(Base):
     __tablename__ = "operation_types"
 

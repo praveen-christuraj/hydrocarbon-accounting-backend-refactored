@@ -301,6 +301,43 @@ class AssetAssignmentResponse(AssetAssignmentBase):
 
     model_config = ConfigDict(from_attributes=True)
 
+# -------------------------
+# Prime Mover - Tanker Link Schemas
+# -------------------------
+
+class PrimeMoverTankerLinkBase(BaseModel):
+    prime_mover_asset_code: str
+    tanker_asset_code: str
+    linked_from: date
+    linked_to: Optional[date] = None
+    remarks: Optional[str] = None
+    status: str = "Active"
+
+
+class PrimeMoverTankerLinkCreate(PrimeMoverTankerLinkBase):
+    pass
+
+
+class PrimeMoverTankerLinkResponse(PrimeMoverTankerLinkBase):
+    id: int
+
+    prime_mover_asset_name: Optional[str] = None
+    prime_mover_asset_type_code: Optional[str] = None
+
+    tanker_asset_name: Optional[str] = None
+    tanker_asset_type_code: Optional[str] = None
+    tanker_chassis_number: Optional[str] = None
+
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CurrentPrimeMoverTankerLinkResponse(BaseModel):
+    has_active_link: bool
+    link: Optional[PrimeMoverTankerLinkResponse] = None
 
 class OperationTypeBase(BaseModel):
     operation_type_name: str
@@ -945,6 +982,93 @@ class OperationEntryResponse(BaseModel):
     operation_template_name: str
     values: list[OperationEntryValueResponse]
 
+# -------------------------
+# Tanker Transaction Report Schemas
+# -------------------------
+
+class TankerTransactionReportRow(BaseModel):
+    transaction_id: int
+    operation_number: str
+    ticket_number: Optional[str] = None
+
+    operation_date: date
+    operation_start_datetime: Optional[datetime] = None
+    operation_end_datetime: Optional[datetime] = None
+
+    operation_type_code: str
+    operation_type_name: Optional[str] = None
+
+    location_code: str
+    location_name: Optional[str] = None
+
+    asset_code: str
+    asset_name: Optional[str] = None
+    asset_type_code: Optional[str] = None
+
+    convoy_number: Optional[str] = None
+    tanker_name: Optional[str] = None
+    prime_mover_number: Optional[str] = None
+    chassis_number: Optional[str] = None
+
+    cargo: Optional[str] = None
+    tanker_operation: Optional[str] = None
+    destination: Optional[str] = None
+    loading_bay: Optional[str] = None
+    compartment: Optional[str] = None
+
+    total_dip_cm: float = 0
+    water_dip_cm: float = 0
+    bsw_percent: float = 0
+
+    tank_temperature: Optional[float] = None
+    tank_temperature_unit: Optional[str] = None
+    sample_temperature: Optional[float] = None
+    sample_temperature_unit: Optional[str] = None
+
+    observed_input_type: Optional[str] = None
+    observed_api: Optional[float] = None
+    observed_density: Optional[float] = None
+    api60: Optional[float] = None
+    vcf: Optional[float] = None
+
+    tov_bbl: float = 0
+    free_water_bbl: float = 0
+    gov_bbl: float = 0
+    gsv_bbl: float = 0
+    bsw_bbl: float = 0
+    nsv_bbl: float = 0
+
+    lt_factor: Optional[float] = None
+    lt: float = 0
+    mt: float = 0
+
+    seal_c1: Optional[str] = None
+    seal_c2: Optional[str] = None
+    seal_m1: Optional[str] = None
+    seal_m2: Optional[str] = None
+
+    remarks: Optional[str] = None
+    status: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TankerTransactionReportTotals(BaseModel):
+    rows_count: int = 0
+    total_tov_bbl: float = 0
+    total_free_water_bbl: float = 0
+    total_gov_bbl: float = 0
+    total_gsv_bbl: float = 0
+    total_bsw_bbl: float = 0
+    total_nsv_bbl: float = 0
+    total_lt: float = 0
+    total_mt: float = 0
+
+
+class TankerTransactionReportResponse(BaseModel):
+    rows: list[TankerTransactionReportRow]
+    totals: TankerTransactionReportTotals
 
 class OperationTemplateFieldBase(BaseModel):
     field_name: str
