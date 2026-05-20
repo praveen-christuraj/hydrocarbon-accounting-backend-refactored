@@ -580,7 +580,40 @@ class OperationTemplateField(Base):
         ),
     )
 
+class TankerReceiptAcknowledgement(Base):
+    __tablename__ = "tanker_receipt_acknowledgements"
 
+    id = Column(Integer, primary_key=True, index=True)
+
+    sender_transaction_id = Column(
+        Integer,
+        ForeignKey("operation_transactions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    convoy_number = Column(String(80), nullable=False, index=True)
+    tanker_asset_code = Column(String(80), nullable=True, index=True)
+    prime_mover_asset_code = Column(String(80), nullable=True, index=True)
+
+    receiver_location_code = Column(String(50), nullable=True, index=True)
+
+    acknowledged_by = Column(String(150), nullable=True)
+    acknowledged_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    remarks = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default="Acknowledged")
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "sender_transaction_id",
+            name="unique_tanker_receipt_acknowledgement_per_sender",
+        ),
+    )
+    
 class OperationTransaction(Base):
     __tablename__ = "operation_transactions"
 

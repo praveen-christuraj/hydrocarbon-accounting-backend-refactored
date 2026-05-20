@@ -1070,6 +1070,188 @@ class TankerTransactionReportResponse(BaseModel):
     rows: list[TankerTransactionReportRow]
     totals: TankerTransactionReportTotals
 
+# -------------------------
+# Tanker Tracking Schemas
+# -------------------------
+
+class TankerTrackingSealCheckResponse(BaseModel):
+    seal_name: str
+    sender_value: Optional[str] = None
+    receiver_value: Optional[str] = None
+    status: str
+
+
+class TankerTrackingQuantityComparisonResponse(BaseModel):
+    sender_transaction_id: Optional[int] = None
+    receiver_transaction_id: Optional[int] = None
+
+    sender_gov_bbl: float = 0
+    receiver_gov_bbl: float = 0
+    gov_variance_bbl: float = 0
+
+    sender_gsv_bbl: float = 0
+    receiver_gsv_bbl: float = 0
+    gsv_variance_bbl: float = 0
+
+    sender_nsv_bbl: float = 0
+    receiver_nsv_bbl: float = 0
+    nsv_variance_bbl: float = 0
+    nsv_variance_percent: float = 0
+
+    sender_lt: float = 0
+    receiver_lt: float = 0
+    lt_variance: float = 0
+
+    sender_mt: float = 0
+    receiver_mt: float = 0
+    mt_variance: float = 0
+
+
+class TankerTrackingTicketResponse(BaseModel):
+    transaction_id: int
+    ticket_number: Optional[str] = None
+    operation_number: str
+
+    movement_role: str
+
+    operation_date: date
+    operation_type_code: str
+    operation_type_name: Optional[str] = None
+
+    origin_location_code: str
+    origin_location_name: Optional[str] = None
+    destination_location_code: Optional[str] = None
+    destination_location_name: Optional[str] = None
+    sender_location_code: Optional[str] = None
+    sender_location_name: Optional[str] = None
+    receiver_location_code: Optional[str] = None
+    receiver_location_name: Optional[str] = None
+
+    primary_asset_code: str
+    primary_asset_name: Optional[str] = None
+    primary_asset_type_code: Optional[str] = None
+
+    prime_mover_asset_code: Optional[str] = None
+    prime_mover_asset_name: Optional[str] = None
+
+    tanker_asset_code: Optional[str] = None
+    tanker_asset_name: Optional[str] = None
+    tanker_chassis_number: Optional[str] = None
+
+    convoy_number: Optional[str] = None
+    product_name: Optional[str] = None
+
+    compartment: Optional[str] = None
+    total_dip_cm: float = 0
+    water_dip_cm: float = 0
+    bsw_percent: float = 0
+
+    tank_temperature: Optional[float] = None
+    tank_temperature_unit: Optional[str] = None
+    sample_temperature: Optional[float] = None
+    sample_temperature_unit: Optional[str] = None
+
+    observed_input_type: Optional[str] = None
+    observed_api: Optional[float] = None
+    observed_density: Optional[float] = None
+    api60: Optional[float] = None
+    vcf: Optional[float] = None
+
+    tov_bbl: float = 0
+    free_water_bbl: float = 0
+    gov_bbl: float = 0
+    gsv_bbl: float = 0
+    bsw_bbl: float = 0
+    nsv_bbl: float = 0
+    lt: float = 0
+    mt: float = 0
+
+    seal_c1: Optional[str] = None
+    seal_c2: Optional[str] = None
+    seal_m1: Optional[str] = None
+    seal_m2: Optional[str] = None
+
+    remarks: Optional[str] = None
+    status: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TankerTrackingGroupResponse(BaseModel):
+    group_key: str
+    convoy_number: str
+
+    tanker_asset_code: Optional[str] = None
+    tanker_asset_name: Optional[str] = None
+    tanker_chassis_number: Optional[str] = None
+
+    prime_mover_asset_code: Optional[str] = None
+    prime_mover_asset_name: Optional[str] = None
+
+    product_name: Optional[str] = None
+
+    sender_ticket: Optional[TankerTrackingTicketResponse] = None
+    receiver_tickets: list[TankerTrackingTicketResponse] = []
+    latest_receiver_ticket: Optional[TankerTrackingTicketResponse] = None
+
+    acknowledgement_id: Optional[int] = None
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[datetime] = None
+    acknowledgement_remarks: Optional[str] = None
+
+    seal_checks: list[TankerTrackingSealCheckResponse] = []
+    quantity_comparison: Optional[TankerTrackingQuantityComparisonResponse] = None
+
+    tracking_status: str
+    warning_messages: list[str] = []
+
+
+class TankerTrackingResponse(BaseModel):
+    rows: list[TankerTrackingGroupResponse]
+    total_groups: int = 0
+    pending_receipts: int = 0
+    received_groups: int = 0
+    compared_groups: int = 0
+    seal_mismatch_groups: int = 0
+    quantity_variance_groups: int = 0
+
+# -------------------------
+# Tanker Receipt Acknowledgement Schemas
+# -------------------------
+
+class TankerReceiptAcknowledgementCreate(BaseModel):
+    sender_transaction_id: int
+    receiver_location_code: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class TankerReceiptAcknowledgementResponse(BaseModel):
+    id: int
+    sender_transaction_id: int
+
+    convoy_number: str
+    tanker_asset_code: Optional[str] = None
+    tanker_asset_name: Optional[str] = None
+    tanker_chassis_number: Optional[str] = None
+
+    prime_mover_asset_code: Optional[str] = None
+    prime_mover_asset_name: Optional[str] = None
+
+    receiver_location_code: Optional[str] = None
+    receiver_location_name: Optional[str] = None
+
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: datetime
+
+    remarks: Optional[str] = None
+    status: str
+
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
 class OperationTemplateFieldBase(BaseModel):
     field_name: str
     field_code: str
