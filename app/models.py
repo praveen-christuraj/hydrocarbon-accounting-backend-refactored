@@ -603,7 +603,10 @@ class TankerReceiptAcknowledgement(Base):
 
     remarks = Column(Text, nullable=True)
     status = Column(String(30), nullable=False, default="Acknowledged")
-
+    closed_by = Column(String(150), nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    closure_remarks = Column(Text, nullable=True)
+    
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now())
 

@@ -1199,6 +1199,9 @@ class TankerTrackingGroupResponse(BaseModel):
     acknowledged_by: Optional[str] = None
     acknowledged_at: Optional[datetime] = None
     acknowledgement_remarks: Optional[str] = None
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closure_remarks: Optional[str] = None
 
     seal_checks: list[TankerTrackingSealCheckResponse] = []
     quantity_comparison: Optional[TankerTrackingQuantityComparisonResponse] = None
@@ -1246,11 +1249,20 @@ class TankerReceiptAcknowledgementResponse(BaseModel):
 
     remarks: Optional[str] = None
     status: str
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closure_remarks: Optional[str] = None
 
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TankerTrackingClosureCreate(BaseModel):
+    acknowledgement_id: int
+    closure_remarks: Optional[str] = None
+
 
 class OperationTemplateFieldBase(BaseModel):
     field_name: str

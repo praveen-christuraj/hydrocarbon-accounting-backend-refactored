@@ -26,7 +26,8 @@ app.add_middleware(
 )
 
 from passlib.context import CryptContext
-from sqlalchemy import func, text
+from sqlalchemy import func, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from fastapi.encoders import jsonable_encoder
@@ -96,6 +97,7 @@ from app.schemas import (
     TankerTrackingTicketResponse,
     TankerReceiptAcknowledgementCreate,
     TankerReceiptAcknowledgementResponse,
+    TankerTrackingClosureCreate,
     OperationTemplateCreate,
     OperationTemplateResponse,
     OperationTransactionCreate,
@@ -357,6 +359,63 @@ def clean_optional_text(value):
 
     return cleaned_value
 
+
+APPROVED_TRANSACTION_STATUS = "Approved"
+
+
+def require_approved_transaction_for_tracking(
+    transaction: OperationTransaction | None,
+    action_label: str = "tracking",
+):
+    if not transaction:
+        raise HTTPException(
+            status_code=404,
+            detail="Operation transaction not found",
+        )
+
+    if transaction.status != APPROVED_TRANSACTION_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Only Approved transactions can be used for {action_label}. "
+                f"Current status is {transaction.status}."
+            ),
+        )
+
+
+def is_barge_transaction(transaction: OperationTransaction | None):
+    if not transaction:
+        return False
+
+    return str(transaction.primary_asset_type_code or "").strip().upper() == "BARGE"
+
+
+def resolve_barge_event_type(db: Session, transaction: OperationTransaction):
+    code = str(transaction.operation_type_code or "").strip()
+    code_upper = code.upper()
+
+    operation_type_name = ""
+    if code:
+        op = (
+            db.query(OperationType)
+            .filter(OperationType.operation_type_code.ilike(code))
+            .first()
+        )
+        if op and op.operation_type_name:
+            operation_type_name = str(op.operation_type_name)
+
+    text = f"{code_upper} {operation_type_name}".upper()
+
+    if (
+        "UNLOAD" in text
+        or "DISCHARGE" in text
+        or "RECEIPT" in text
+        or "RECEIVE" in text
+    ):
+        return "UNLOAD"
+
+    return "LOAD"
+
 def ensure_operation_ticket_number_column():
     with engine.connect() as connection:
         connection.execute(
@@ -559,11 +618,50 @@ def ensure_tank_stock_ledger_stock_snapshot_columns():
 
         connection.commit()
 
+
+def ensure_tanker_acknowledgement_closure_columns():
+    inspector = inspect(engine)
+
+    if "tanker_receipt_acknowledgements" not in inspector.get_table_names():
+        return
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("tanker_receipt_acknowledgements")
+    }
+
+    with engine.begin() as connection:
+        if "closed_by" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE tanker_receipt_acknowledgements "
+                    "ADD COLUMN closed_by VARCHAR(150)"
+                )
+            )
+
+        if "closed_at" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE tanker_receipt_acknowledgements "
+                    "ADD COLUMN closed_at TIMESTAMP"
+                )
+            )
+
+        if "closure_remarks" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE tanker_receipt_acknowledgements "
+                    "ADD COLUMN closure_remarks TEXT"
+                )
+            )
+
+
 Base.metadata.create_all(bind=engine)
 ensure_operation_ticket_number_column()
 ensure_operation_template_layout_columns()
 ensure_tank_stock_ledger_accounting_columns()
 ensure_tank_stock_ledger_stock_snapshot_columns()
+ensure_tanker_acknowledgement_closure_columns()
 
 
 @app.get("/")
@@ -10808,21 +10906,6 @@ def get_tanker_transaction_report(
 # Tanker Tracking APIs
 # -------------------------
 
-APPROVED_TRANSACTION_STATUS = "Approved"
-
-def require_approved_transaction_for_tracking(
-    transaction: OperationTransaction,
-    action_label: str = "tracking",
-):
-    if transaction.status != APPROVED_TRANSACTION_STATUS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Only Approved transactions can be used for {action_label}. "
-                f"Current status is {transaction.status}."
-            ),
-        )
-
 def get_payload_asset_value(payload: dict, section_names: list[str], keys: list[str]):
     for section_name in section_names:
         section = payload.get(section_name)
@@ -11181,7 +11264,7 @@ def get_tanker_acknowledgement_by_sender(
         .filter(
             TankerReceiptAcknowledgement.sender_transaction_id
             == sender_transaction_id,
-            TankerReceiptAcknowledgement.status == "Acknowledged",
+            TankerReceiptAcknowledgement.status.in_(["Acknowledged", "Closed"]),
         )
         .first()
     )
@@ -11236,6 +11319,9 @@ def build_tanker_acknowledgement_response(
         "acknowledged_at": acknowledgement.acknowledged_at,
         "remarks": acknowledgement.remarks,
         "status": acknowledgement.status,
+        "closed_by": acknowledgement.closed_by,
+        "closed_at": acknowledgement.closed_at,
+        "closure_remarks": acknowledgement.closure_remarks,
         "created_at": acknowledgement.created_at,
         "updated_at": acknowledgement.updated_at,
     }
@@ -11255,11 +11341,14 @@ def get_tanker_tracking_group_status(
     quantity_comparison: dict | None,
     acknowledgement: TankerReceiptAcknowledgement | None = None,
 ):
+    if acknowledgement and acknowledgement.status == "Closed":
+        return "CLOSED"
+
     if not sender_ticket:
         return "NO_SENDER"
 
     if len(receiver_tickets) == 0:
-        if acknowledgement:
+        if acknowledgement and acknowledgement.status == "Acknowledged":
             return "ACKNOWLEDGED"
 
         return "PENDING_RECEIPT"
@@ -11421,6 +11510,9 @@ def build_tanker_tracking_groups(tickets: list[dict], db: Session):
                 "acknowledgement_remarks": acknowledgement.remarks
                 if acknowledgement
                 else None,
+                "closed_by": acknowledgement.closed_by if acknowledgement else None,
+                "closed_at": acknowledgement.closed_at if acknowledgement else None,
+                "closure_remarks": acknowledgement.closure_remarks if acknowledgement else None,
 
                 "tracking_status": tracking_status,
                 "warning_messages": warning_messages,
@@ -12024,8 +12116,145 @@ def revoke_tanker_receipt_acknowledgement(
         db,
     )
 
+
+@app.post(
+    "/tanker-tracking/close",
+    response_model=TankerReceiptAcknowledgementResponse,
+)
+def close_tanker_tracking_movement(
+    request: TankerTrackingClosureCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(
+        current_user,
+        "Create Operation Entry",
+        db,
+    )
+
+    acknowledgement = (
+        db.query(TankerReceiptAcknowledgement)
+        .filter(TankerReceiptAcknowledgement.id == request.acknowledgement_id)
+        .first()
+    )
+
+    if not acknowledgement:
+        raise HTTPException(
+            status_code=404,
+            detail="Tanker acknowledgement not found",
+        )
+
+    if acknowledgement.status == "Revoked":
+        raise HTTPException(
+            status_code=400,
+            detail="Revoked tanker acknowledgement cannot be closed",
+        )
+
+    if acknowledgement.status == "Closed":
+        raise HTTPException(
+            status_code=400,
+            detail="This tanker movement is already closed",
+        )
+
+    sender_transaction = (
+        db.query(OperationTransaction)
+        .filter(OperationTransaction.id == acknowledgement.sender_transaction_id)
+        .first()
+    )
+
+    if not sender_transaction:
+        raise HTTPException(
+            status_code=404,
+            detail="Sender transaction not found",
+        )
+
+    require_approved_transaction_for_tracking(
+        sender_transaction,
+        "tanker movement closure",
+    )
+
+    tracking_rows = get_tanker_tracking_rows(
+        db=db,
+        convoy_number=acknowledgement.convoy_number,
+        tanker_asset_code=acknowledgement.tanker_asset_code,
+    )
+
+    target_row = None
+
+    for row in tracking_rows:
+        if row.get("acknowledgement_id") == acknowledgement.id:
+            target_row = row
+            break
+
+    if not target_row:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to find tanker tracking row for this acknowledgement",
+        )
+
+    if not target_row.get("latest_receiver_ticket"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot close tanker movement before receiver ticket is Approved",
+        )
+
+    if not target_row.get("quantity_comparison"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot close tanker movement before quantity comparison is available",
+        )
+
+    before_data = build_tanker_acknowledgement_audit_snapshot(
+        acknowledgement,
+        db,
+    )
+
+    acknowledgement.status = "Closed"
+    acknowledgement.closed_by = get_current_user_label(current_user)
+    acknowledgement.closed_at = datetime.utcnow()
+    acknowledgement.closure_remarks = clean_optional_text(request.closure_remarks)
+    acknowledgement.updated_at = datetime.utcnow()
+
+    db.flush()
+
+    after_data = build_tanker_acknowledgement_audit_snapshot(
+        acknowledgement,
+        db,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Tanker Tracking",
+        action="Close Tanker Movement",
+        current_user=current_user,
+        entity_type="TankerReceiptAcknowledgement",
+        entity_id=acknowledgement.id,
+        entity_label=(
+            f"{acknowledgement.convoy_number} - "
+            f"{acknowledgement.tanker_asset_code or ''}"
+        ),
+        ticket_number=get_transaction_ticket_number(sender_transaction),
+        operation_number=sender_transaction.operation_number,
+        remarks="Tanker movement closed after comparison",
+        request_path="/tanker-tracking/close",
+        details={
+            "before": before_data,
+            "after": after_data,
+            "comparison": target_row.get("quantity_comparison"),
+            "tracking_status_before_close": target_row.get("tracking_status"),
+        },
+    )
+
+    db.commit()
+    db.refresh(acknowledgement)
+
+    return build_tanker_acknowledgement_response(
+        acknowledgement,
+        db,
+    )
+
 # -------------------------
-# Convoy / Trip Tracking APIs
+# Barge / Trip Tracking APIs
 # -------------------------
 
 @app.get("/convoy-tracker", response_model=ConvoyTrackerResponse)
@@ -12051,8 +12280,14 @@ def get_convoy_tracker(
 
     transactions = (
         db.query(OperationTransaction)
-        .filter(OperationTransaction.convoy_number.ilike(convoy))
-        .order_by(OperationTransaction.operation_date.asc(), OperationTransaction.id.asc())
+        .filter(
+            OperationTransaction.convoy_number.ilike(convoy),
+            OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+        )
+        .order_by(
+            OperationTransaction.operation_date.asc(),
+            OperationTransaction.id.asc(),
+        )
         .all()
     )
 
@@ -12094,6 +12329,129 @@ def get_convoy_tracker(
     }
 
 
+@app.get("/barge-tracking", response_model=ConvoyTrackerResponse)
+def get_barge_tracking(
+    convoy_number: str,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    return get_convoy_tracker(
+        convoy_number=convoy_number,
+        current_user=current_user,
+        db=db,
+    )
+
+def ensure_barge_unload_comparison(
+    db: Session,
+    trip: Trip,
+    asset_code: str,
+    unload_tx: OperationTransaction,
+    current_user: User,
+    remarks: str | None = None,
+):
+    if not trip or not unload_tx:
+        return None
+
+    require_approved_transaction_for_tracking(unload_tx, "barge comparison")
+
+    asset = str(asset_code or "").strip()
+    if not asset:
+        return None
+
+    comparison_type = "LOAD_AFTER_vs_UNLOAD_BEFORE"
+
+    # Latest LOAD for same trip+barge
+    latest_load_event = (
+        db.query(TripEvent)
+        .filter(
+            TripEvent.trip_id == trip.id,
+            TripEvent.asset_code == asset,
+            TripEvent.event_type.in_(["LOAD_1", "LOAD_2_TOPUP"]),
+            TripEvent.operation_transaction_id.isnot(None),
+        )
+        .order_by(TripEvent.sequence_no.desc(), TripEvent.id.desc())
+        .first()
+    )
+
+    if not latest_load_event or not latest_load_event.operation_transaction_id:
+        return None
+
+    left_tx = (
+        db.query(OperationTransaction)
+        .filter(OperationTransaction.id == latest_load_event.operation_transaction_id)
+        .first()
+    )
+
+    require_approved_transaction_for_tracking(left_tx, "barge comparison")
+
+    existing = (
+        db.query(TripComparison)
+        .filter(
+            TripComparison.trip_id == trip.id,
+            TripComparison.comparison_type == comparison_type,
+            TripComparison.left_transaction_id == left_tx.id,
+            TripComparison.right_transaction_id == unload_tx.id,
+        )
+        .first()
+    )
+    if existing:
+        return existing
+
+    left_payload = load_multi_tank_payload(db, left_tx.id)
+    right_payload = load_multi_tank_payload(db, unload_tx.id)
+
+    # If these are not Multi-Tank tickets, we cannot auto-build the comparison JSON
+    if not left_payload or not right_payload:
+        return None
+
+    summary_json, per_tank_json = build_multitank_comparison_json(
+        left_tx=left_tx,
+        right_tx=unload_tx,
+        comparison_type=comparison_type,
+        left_payload=left_payload,
+        right_payload=right_payload,
+    )
+
+    created_by_display = get_current_user_display_name(current_user)
+
+    new_cmp = TripComparison(
+        trip_id=trip.id,
+        comparison_type=comparison_type,
+        left_transaction_id=left_tx.id,
+        right_transaction_id=unload_tx.id,
+        summary_json=summary_json,
+        per_tank_json=per_tank_json,
+        created_by=created_by_display,
+        remarks=clean_optional_text(remarks) or "Auto-created on UNLOAD event tagging",
+    )
+
+    db.add(new_cmp)
+    db.flush()
+
+    create_audit_log(
+        db=db,
+        module_name="Barge Tracking",
+        action="Auto Create Barge Comparison",
+        current_user=current_user,
+        entity_type="TripComparison",
+        entity_id=new_cmp.id,
+        entity_label=f"{trip.convoy_number} | {asset} | {comparison_type}",
+        ticket_number=get_transaction_ticket_number(left_tx),
+        operation_number=left_tx.operation_number,
+        remarks="Auto-created from trip event tagging",
+        request_path="/trip-events",
+        details={
+            "convoy_number": trip.convoy_number,
+            "trip_id": trip.id,
+            "asset_code": asset,
+            "comparison_type": comparison_type,
+            "left_transaction_id": left_tx.id,
+            "right_transaction_id": unload_tx.id,
+        },
+    )
+
+    return new_cmp
+
 @app.post("/trip-events", response_model=TripEventResponse)
 def create_trip_event(
     request: TripEventCreate,
@@ -12130,6 +12488,12 @@ def create_trip_event(
                 detail="asset_code does not match the operation ticket primary_asset_code",
             )
 
+        # ✅ Approved-only rule for any event linked to a ticket
+        require_approved_transaction_for_tracking(
+            tx,
+            "barge timeline event",
+        )
+
         # Align convoy if needed
         if clean_optional_text(tx.convoy_number) is None:
             tx.convoy_number = convoy
@@ -12139,6 +12503,66 @@ def create_trip_event(
                 status_code=400,
                 detail="Ticket convoy_number does not match request convoy_number",
             )
+
+        # ✅ Idempotency: if the ticket already has an event, UPDATE it instead of INSERT
+        existing_event_for_ticket = (
+            db.query(TripEvent)
+            .filter(TripEvent.operation_transaction_id == tx.id)
+            .first()
+        )
+        if existing_event_for_ticket:
+            existing_event_for_ticket.event_type = (
+                clean_optional_text(request.event_type)
+                or existing_event_for_ticket.event_type
+            )
+            existing_event_for_ticket.location_code = (
+                clean_optional_text(request.location_code)
+                or existing_event_for_ticket.location_code
+            )
+            existing_event_for_ticket.asset_code = asset_code
+            existing_event_for_ticket.event_datetime = (
+                request.event_datetime
+                or existing_event_for_ticket.event_datetime
+            )
+
+            cleaned_remarks = clean_optional_text(request.remarks)
+            if cleaned_remarks:
+                existing_event_for_ticket.remarks = cleaned_remarks
+
+            existing_event_for_ticket.updated_at = datetime.now()
+            db.commit()
+            db.refresh(existing_event_for_ticket)
+
+            # ✅ If timeline is being corrected to UNLOAD, backfill comparison now
+            if tx and str(existing_event_for_ticket.event_type or "").strip().upper() == "UNLOAD":
+                trip_for_cmp = db.query(Trip).filter(Trip.convoy_number.ilike(convoy)).first()
+                if trip_for_cmp:
+                    ensure_trip_not_closed(trip_for_cmp)
+                    ensure_barge_unload_comparison(
+                        db=db,
+                        trip=trip_for_cmp,
+                        asset_code=asset_code,
+                        unload_tx=tx,
+                        current_user=current_user,
+                        remarks="Backfilled from Fix Timeline",
+                    )
+                    db.commit()
+
+            return {
+                "id": existing_event_for_ticket.id,
+                "trip_id": existing_event_for_ticket.trip_id,
+                "convoy_number": convoy,
+                "event_type": existing_event_for_ticket.event_type,
+                "location_code": existing_event_for_ticket.location_code,
+                "asset_code": existing_event_for_ticket.asset_code,
+                "operation_transaction_id": existing_event_for_ticket.operation_transaction_id,
+                "sequence_no": existing_event_for_ticket.sequence_no,
+                "event_datetime": existing_event_for_ticket.event_datetime,
+                "created_by": existing_event_for_ticket.created_by,
+                "remarks": existing_event_for_ticket.remarks,
+                "created_at": existing_event_for_ticket.created_at,
+                "updated_at": existing_event_for_ticket.updated_at,
+            }
 
     # Ensure Trip exists
     trip = db.query(Trip).filter(Trip.convoy_number.ilike(convoy)).first()
@@ -12154,7 +12578,7 @@ def create_trip_event(
         )
         db.add(trip)
         db.flush()
-    
+
     ensure_trip_not_closed(trip)
 
     # Auto sequence if missing
@@ -12172,7 +12596,7 @@ def create_trip_event(
     if event_type is None:
         raise HTTPException(status_code=400, detail="event_type is required")
 
-    # ✅ location_code must exist for ACK events (no ticket)
+    # location_code must exist for ACK events (no ticket)
     location_code = clean_optional_text(request.location_code)
     if location_code is None and tx is not None:
         location_code = clean_optional_text(tx.origin_location_code)
@@ -12203,12 +12627,55 @@ def create_trip_event(
         remarks=clean_optional_text(request.remarks),
     )
 
-    db.add(new_event)
-    db.flush()
+    try:
+        db.add(new_event)
+        db.flush()
+    except IntegrityError:
+        # ✅ Safety net (race/duplicate click): fetch existing + update instead of 500
+        db.rollback()
+
+        if op_tx_id is not None:
+            existing = (
+                db.query(TripEvent)
+                .filter(TripEvent.operation_transaction_id == op_tx_id)
+                .first()
+            )
+            if existing:
+                existing.event_type = event_type.upper()
+                existing.location_code = location_code
+                existing.asset_code = asset_code
+                existing.event_datetime = event_datetime
+                cleaned_remarks = clean_optional_text(request.remarks)
+                if cleaned_remarks:
+                    existing.remarks = cleaned_remarks
+                existing.updated_at = datetime.now()
+                db.commit()
+                db.refresh(existing)
+
+                return {
+                    "id": existing.id,
+                    "trip_id": existing.trip_id,
+                    "convoy_number": convoy,
+                    "event_type": existing.event_type,
+                    "location_code": existing.location_code,
+                    "asset_code": existing.asset_code,
+                    "operation_transaction_id": existing.operation_transaction_id,
+                    "sequence_no": existing.sequence_no,
+                    "event_datetime": existing.event_datetime,
+                    "created_by": existing.created_by,
+                    "remarks": existing.remarks,
+                    "created_at": existing.created_at,
+                    "updated_at": existing.updated_at,
+                }
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create/update trip event due to duplicate operation_transaction_id",
+        )
 
     create_audit_log(
         db=db,
-        module_name="Convoy Tracker",
+        module_name="Barge Tracking",
         action="Create Trip Event",
         current_user=current_user,
         entity_type="TripEvent",
@@ -12228,6 +12695,17 @@ def create_trip_event(
             "sequence_no": sequence_no,
         },
     )
+
+    # ✅ If this newly created event is UNLOAD and linked to an approved ticket, create comparison
+    if tx and str(new_event.event_type or "").strip().upper() == "UNLOAD":
+        ensure_barge_unload_comparison(
+            db=db,
+            trip=trip,
+            asset_code=asset_code,
+            unload_tx=tx,
+            current_user=current_user,
+            remarks="Auto-created from trip event creation",
+        )
 
     db.commit()
     db.refresh(new_event)
@@ -12626,6 +13104,16 @@ def create_trip_comparison(
     if not left_tx or not right_tx:
         raise HTTPException(status_code=404, detail="Left or Right transaction not found")
 
+    require_approved_transaction_for_tracking(
+        left_tx,
+        "barge sender/receiver comparison",
+    )
+
+    require_approved_transaction_for_tracking(
+        right_tx,
+        "barge sender/receiver comparison",
+    )
+
     # Align ticket convoy if missing
     if clean_optional_text(left_tx.convoy_number) is None:
         left_tx.convoy_number = convoy
@@ -12692,15 +13180,15 @@ def create_trip_comparison(
 
     create_audit_log(
         db=db,
-        module_name="Convoy Tracker",
-        action="Create Trip Comparison",
+        module_name="Barge Tracking",
+        action="Create Barge Comparison",
         current_user=current_user,
         entity_type="TripComparison",
         entity_id=new_cmp.id,
         entity_label=f"{convoy} | {comparison_type}",
         ticket_number=get_transaction_ticket_number(left_tx),
         operation_number=left_tx.operation_number,
-        remarks="Trip comparison created",
+        remarks="Barge comparison created",
         request_path="/trip-comparisons",
         details={
             "convoy_number": convoy,
@@ -12755,6 +13243,97 @@ def ensure_trip_not_closed(trip: Trip | None):
             detail="Trip is CLOSED for this convoy. Reopen the trip to continue.",
         )
 
+def require_barge_tracking_ready_for_closure(
+    trip: Trip,
+    db: Session,
+):
+    approved_transactions = (
+        db.query(OperationTransaction)
+        .filter(
+            OperationTransaction.convoy_number.ilike(trip.convoy_number),
+            OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            OperationTransaction.primary_asset_type_code.ilike("BARGE"),
+        )
+        .all()
+    )
+
+    approved_asset_codes = {
+        str(tx.primary_asset_code or "").strip()
+        for tx in approved_transactions
+        if str(tx.primary_asset_code or "").strip()
+    }
+
+    if len(approved_asset_codes) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot close barge movement because no Approved barge tickets were found.",
+        )
+
+    if len(approved_transactions) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cannot close barge movement before both sender and receiver "
+                "transactions are Approved."
+            ),
+        )
+
+    comparisons = (
+        db.query(TripComparison)
+        .filter(TripComparison.trip_id == trip.id)
+        .all()
+    )
+
+    compared_asset_codes = set()
+
+    for comparison in comparisons:
+        # Only sender/receiver comparison should qualify for closure
+        if str(comparison.comparison_type or "").strip() != "LOAD_AFTER_vs_UNLOAD_BEFORE":
+            continue
+
+        left_tx = (
+            db.query(OperationTransaction)
+            .filter(OperationTransaction.id == comparison.left_transaction_id)
+            .first()
+        )
+
+        right_tx = (
+            db.query(OperationTransaction)
+            .filter(OperationTransaction.id == comparison.right_transaction_id)
+            .first()
+        )
+
+        if not left_tx or not right_tx:
+            continue
+
+        if left_tx.status != APPROVED_TRANSACTION_STATUS:
+            continue
+
+        if right_tx.status != APPROVED_TRANSACTION_STATUS:
+            continue
+
+        if str(left_tx.primary_asset_code or "").strip().lower() != str(
+            right_tx.primary_asset_code or ""
+        ).strip().lower():
+            continue
+
+        asset_code = str(left_tx.primary_asset_code or "").strip()
+
+        if asset_code:
+            compared_asset_codes.add(asset_code)
+
+    pending_asset_codes = sorted(
+        list(approved_asset_codes - compared_asset_codes)
+    )
+
+    if pending_asset_codes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cannot close convoy because comparison is pending for barge(s): "
+                + ", ".join(pending_asset_codes)
+            ),
+        )
 
 @app.post("/trips/{trip_id}/close")
 def close_trip(
@@ -12766,41 +13345,57 @@ def close_trip(
     require_user_permission(current_user, "Create Operation Entry", db)
 
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
+
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
     if str(trip.status or "").upper() == "CLOSED":
-        return {"message": "Trip already CLOSED", "trip_id": trip.id, "status": trip.status}
+        return {
+            "message": "Barge movement already CLOSED",
+            "trip_id": trip.id,
+            "status": trip.status,
+        }
+
+    require_barge_tracking_ready_for_closure(trip, db)
 
     before_status = trip.status
     trip.status = "CLOSED"
     trip.updated_at = datetime.now()
 
-    if request and clean_optional_text(request.remarks):
-        trip.remarks = (trip.remarks or "") + f"\n[Trip Closed] {clean_optional_text(request.remarks)}"
+    closure_remarks = clean_optional_text(request.remarks) if request else None
+
+    if closure_remarks:
+        trip.remarks = (
+            f"{trip.remarks or ''}\n"
+            f"[Barge Movement Closed] {closure_remarks}"
+        ).strip()
 
     create_audit_log(
         db=db,
-        module_name="Convoy Tracker",
-        action="Close Trip",
+        module_name="Barge Tracking",
+        action="Close Barge Movement",
         current_user=current_user,
         entity_type="Trip",
         entity_id=trip.id,
         entity_label=trip.convoy_number,
-        remarks="Trip closed manually",
+        remarks="Barge movement closed after comparison review",
         request_path=f"/trips/{trip_id}/close",
         details={
             "convoy_number": trip.convoy_number,
             "before_status": before_status,
             "after_status": trip.status,
+            "closure_remarks": closure_remarks,
         },
     )
 
     db.commit()
     db.refresh(trip)
 
-    return {"message": "Trip CLOSED", "trip_id": trip.id, "status": trip.status}
-
+    return {
+        "message": "Barge movement CLOSED",
+        "trip_id": trip.id,
+        "status": trip.status,
+    }
 
 @app.post("/trips/{trip_id}/reopen")
 def reopen_trip(
@@ -12812,41 +13407,55 @@ def reopen_trip(
     require_user_permission(current_user, "Create Operation Entry", db)
 
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
+
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
     if str(trip.status or "").upper() == "OPEN":
-        return {"message": "Trip already OPEN", "trip_id": trip.id, "status": trip.status}
+        return {
+            "message": "Barge movement already OPEN",
+            "trip_id": trip.id,
+            "status": trip.status,
+        }
 
     before_status = trip.status
     trip.status = "OPEN"
     trip.updated_at = datetime.now()
 
-    if request and clean_optional_text(request.remarks):
-        trip.remarks = (trip.remarks or "") + f"\n[Trip Reopened] {clean_optional_text(request.remarks)}"
+    reopen_remarks = clean_optional_text(request.remarks) if request else None
+
+    if reopen_remarks:
+        trip.remarks = (
+            f"{trip.remarks or ''}\n"
+            f"[Barge Movement Reopened] {reopen_remarks}"
+        ).strip()
 
     create_audit_log(
         db=db,
-        module_name="Convoy Tracker",
-        action="Reopen Trip",
+        module_name="Barge Tracking",
+        action="Reopen Barge Movement",
         current_user=current_user,
         entity_type="Trip",
         entity_id=trip.id,
         entity_label=trip.convoy_number,
-        remarks="Trip reopened manually",
+        remarks="Barge movement reopened manually",
         request_path=f"/trips/{trip_id}/reopen",
         details={
             "convoy_number": trip.convoy_number,
             "before_status": before_status,
             "after_status": trip.status,
+            "reopen_remarks": reopen_remarks,
         },
     )
 
     db.commit()
     db.refresh(trip)
 
-    return {"message": "Trip REOPENED", "trip_id": trip.id, "status": trip.status}
-
+    return {
+        "message": "Barge movement OPEN",
+        "trip_id": trip.id,
+        "status": trip.status,
+    }
 
 # -------------------------
 # Tank Stock Ledger Creation Helpers
@@ -13695,37 +14304,27 @@ def validate_multi_tank_seals_before_submit(
         "mismatch_count": mismatch_count,
     }
 
-def auto_create_trip_event_on_submit(
+def auto_create_barge_tracking_on_approval(
     db: Session,
     transaction: OperationTransaction,
     current_user: User,
 ):
-    """
-    Auto-create Trip + TripEvent when a BARGE ticket is submitted and convoy_number is present.
-
-    Rule:
-      - First event for (convoy + asset) => LOAD_1
-      - Next submitted ticket for same (convoy + asset) => LOAD_2_TOPUP
-    """
     convoy = clean_optional_text(transaction.convoy_number)
-
-    # Only apply when convoy is present and asset type is BARGE
     if convoy is None:
-        return None, None
+        return None, None, None
 
-    if str(transaction.primary_asset_type_code or "").strip().upper() != "BARGE":
-        return None, None
+    if not is_barge_transaction(transaction):
+        return None, None, None
+
+    require_approved_transaction_for_tracking(transaction, "barge tracking")
 
     asset_code = str(transaction.primary_asset_code or "").strip()
-
     if not asset_code:
-        return None, None
+        return None, None, None
 
     created_by_display = get_current_user_display_name(current_user)
 
-    # Ensure Trip exists
     trip = db.query(Trip).filter(Trip.convoy_number.ilike(convoy)).first()
-
     if not trip:
         trip = Trip(
             convoy_number=convoy,
@@ -13737,16 +14336,25 @@ def auto_create_trip_event_on_submit(
         db.add(trip)
         db.flush()
 
-    # Find last event for this trip+asset (if any)
-    last_event = (
-        db.query(TripEvent)
-        .filter(TripEvent.trip_id == trip.id)
-        .filter(TripEvent.asset_code == asset_code)
-        .order_by(TripEvent.sequence_no.desc(), TripEvent.id.desc())
-        .first()
-    )
+    ensure_trip_not_closed(trip)
 
-    # Prevent duplicate linking for same ticket
+    movement_type = resolve_barge_event_type(db, transaction)
+    if movement_type == "UNLOAD":
+        event_type = "UNLOAD"
+    else:
+        previous_load_event = (
+            db.query(TripEvent)
+            .filter(
+                TripEvent.trip_id == trip.id,
+                TripEvent.asset_code == asset_code,
+                TripEvent.event_type.in_(["LOAD_1", "LOAD_2_TOPUP"]),
+            )
+            .order_by(TripEvent.sequence_no.desc(), TripEvent.id.desc())
+            .first()
+        )
+        event_type = "LOAD_1" if not previous_load_event else "LOAD_2_TOPUP"
+
+    # ✅ If event already exists for this ticket, UPDATE it (do NOT return early)
     existing_event_for_ticket = (
         db.query(TripEvent)
         .filter(TripEvent.operation_transaction_id == transaction.id)
@@ -13754,99 +14362,142 @@ def auto_create_trip_event_on_submit(
     )
 
     if existing_event_for_ticket:
-        return trip, None
-
-    # Determine event type
-    event_type = "LOAD_1" if not last_event else "LOAD_2_TOPUP"
-
-    # Next sequence no
-    max_seq = (
-        db.query(func.max(TripEvent.sequence_no))
-        .filter(TripEvent.trip_id == trip.id)
-        .scalar()
-    )
-    seq = (max_seq or 0) + 1
-
-    new_event = TripEvent(
-        trip_id=trip.id,
-        event_type=event_type,
-        location_code=clean_optional_text(transaction.origin_location_code),
-        asset_code=asset_code,
-        operation_transaction_id=transaction.id,
-        sequence_no=seq,
-        event_datetime=transaction.operation_start_datetime or datetime.now(),
-        created_by=created_by_display,
-        remarks="Auto-created on Submit",
-    )
-
-    db.add(new_event)
-    db.flush()
-
-    # Create a basic continuity comparison record if there is a previous event
-    new_cmp = None
-
-    if last_event:
-        prev_tx_id = last_event.operation_transaction_id
-        # Only create if both tickets are under same convoy (should be true)
-        new_cmp = TripComparison(
-            trip_id=trip.id,
-            comparison_type="LOAD_PREV_vs_LOAD_CURRENT",
-            left_transaction_id=prev_tx_id,
-            right_transaction_id=transaction.id,
-            summary_json=None,
-            per_tank_json=None,
-            created_by=created_by_display,
-            remarks="Auto-created continuity placeholder (calculation to be added)",
+        existing_event_for_ticket.event_type = event_type
+        existing_event_for_ticket.location_code = clean_optional_text(transaction.origin_location_code)
+        existing_event_for_ticket.asset_code = asset_code
+        existing_event_for_ticket.event_datetime = transaction.operation_start_datetime or existing_event_for_ticket.event_datetime
+        existing_event_for_ticket.updated_at = datetime.now()
+        new_event = existing_event_for_ticket
+        db.flush()
+    else:
+        max_seq = (
+            db.query(func.max(TripEvent.sequence_no))
+            .filter(TripEvent.trip_id == trip.id)
+            .scalar()
         )
-        db.add(new_cmp)
+        sequence_no = (max_seq or 0) + 1
+
+        new_event = TripEvent(
+            trip_id=trip.id,
+            event_type=event_type,
+            location_code=clean_optional_text(transaction.origin_location_code),
+            asset_code=asset_code,
+            operation_transaction_id=transaction.id,
+            sequence_no=sequence_no,
+            event_datetime=transaction.operation_start_datetime or datetime.now(),
+            created_by=created_by_display,
+            remarks="Auto-created on Approval",
+        )
+
+        db.add(new_event)
         db.flush()
 
-    # Audit logs for auto objects (so Audit Log is complete)
-    create_audit_log(
-        db=db,
-        module_name="Convoy Tracker",
-        action="Auto Create Trip Event",
-        current_user=current_user,
-        entity_type="TripEvent",
-        entity_id=new_event.id,
-        entity_label=f"{convoy} | {event_type} | {asset_code}",
-        ticket_number=get_transaction_ticket_number(transaction),
-        operation_number=transaction.operation_number,
-        remarks="Auto created on Submit",
-        request_path="/operation-transactions/{id}/status",
-        details={
-            "convoy_number": convoy,
-            "trip_id": trip.id,
-            "event_type": event_type,
-            "asset_code": asset_code,
-            "operation_transaction_id": transaction.id,
-            "sequence_no": seq,
-        },
-    )
-
-    if new_cmp:
         create_audit_log(
             db=db,
-            module_name="Convoy Tracker",
-            action="Auto Create Trip Comparison",
+            module_name="Barge Tracking",
+            action="Auto Create Barge Event",
             current_user=current_user,
-            entity_type="TripComparison",
-            entity_id=new_cmp.id,
-            entity_label=f"{convoy} | LOAD_PREV_vs_LOAD_CURRENT",
+            entity_type="TripEvent",
+            entity_id=new_event.id,
+            entity_label=f"{convoy} | {event_type} | {asset_code}",
             ticket_number=get_transaction_ticket_number(transaction),
             operation_number=transaction.operation_number,
-            remarks="Auto created on Submit (placeholder)",
+            remarks="Auto-created on Approval",
             request_path="/operation-transactions/{id}/status",
             details={
                 "convoy_number": convoy,
                 "trip_id": trip.id,
-                "comparison_type": "LOAD_PREV_vs_LOAD_CURRENT",
-                "left_transaction_id": new_cmp.left_transaction_id,
-                "right_transaction_id": new_cmp.right_transaction_id,
+                "event_type": event_type,
+                "asset_code": asset_code,
+                "operation_transaction_id": transaction.id,
+                "sequence_no": new_event.sequence_no,
             },
         )
 
-    return trip, new_event
+    # ✅ Comparison creation must happen even if the event existed earlier
+    new_comparison = None
+
+    if event_type == "UNLOAD":
+        latest_load_event = (
+            db.query(TripEvent)
+            .filter(
+                TripEvent.trip_id == trip.id,
+                TripEvent.asset_code == asset_code,
+                TripEvent.event_type.in_(["LOAD_1", "LOAD_2_TOPUP"]),
+                TripEvent.operation_transaction_id.isnot(None),
+            )
+            .order_by(TripEvent.sequence_no.desc(), TripEvent.id.desc())
+            .first()
+        )
+
+        if latest_load_event and latest_load_event.operation_transaction_id:
+            existing_comparison = (
+                db.query(TripComparison)
+                .filter(
+                    TripComparison.trip_id == trip.id,
+                    TripComparison.comparison_type == "LOAD_AFTER_vs_UNLOAD_BEFORE",
+                    TripComparison.left_transaction_id == latest_load_event.operation_transaction_id,
+                    TripComparison.right_transaction_id == transaction.id,
+                )
+                .first()
+            )
+
+            if not existing_comparison:
+                left_tx = (
+                    db.query(OperationTransaction)
+                    .filter(OperationTransaction.id == latest_load_event.operation_transaction_id)
+                    .first()
+                )
+
+                require_approved_transaction_for_tracking(left_tx, "barge comparison")
+
+                left_payload = load_multi_tank_payload(db, left_tx.id) if left_tx else None
+                right_payload = load_multi_tank_payload(db, transaction.id)
+
+                if left_payload and right_payload:
+                    summary_json, per_tank_json = build_multitank_comparison_json(
+                        left_tx=left_tx,
+                        right_tx=transaction,
+                        comparison_type="LOAD_AFTER_vs_UNLOAD_BEFORE",
+                        left_payload=left_payload,
+                        right_payload=right_payload,
+                    )
+
+                    new_comparison = TripComparison(
+                        trip_id=trip.id,
+                        comparison_type="LOAD_AFTER_vs_UNLOAD_BEFORE",
+                        left_transaction_id=left_tx.id,
+                        right_transaction_id=transaction.id,
+                        summary_json=summary_json,
+                        per_tank_json=per_tank_json,
+                        created_by=created_by_display,
+                        remarks="Auto-created on Approval",
+                    )
+                    db.add(new_comparison)
+                    db.flush()
+
+                    create_audit_log(
+                        db=db,
+                        module_name="Barge Tracking",
+                        action="Auto Create Trip Comparison",
+                        current_user=current_user,
+                        entity_type="TripComparison",
+                        entity_id=new_comparison.id,
+                        entity_label=f"{convoy} | {asset_code} | LOAD_AFTER_vs_UNLOAD_BEFORE",
+                        ticket_number=get_transaction_ticket_number(transaction),
+                        operation_number=transaction.operation_number,
+                        remarks="Auto-created on Approval",
+                        request_path="/operation-transactions/{id}/status",
+                        details={
+                            "convoy_number": convoy,
+                            "trip_id": trip.id,
+                            "comparison_type": "LOAD_AFTER_vs_UNLOAD_BEFORE",
+                            "left_transaction_id": left_tx.id,
+                            "right_transaction_id": transaction.id,
+                        },
+                    )
+
+    return trip, new_event, new_comparison
 
 @app.patch("/operation-transactions/{transaction_id}/status")
 def update_operation_transaction_status(
@@ -13913,15 +14564,17 @@ def update_operation_transaction_status(
     transaction.status = next_status
     transaction.updated_at = datetime.now()
 
-        # Auto trip tracking on submit (LOAD_1 / LOAD_2_TOPUP)
-    if next_status == "Submitted":
-        auto_create_trip_event_on_submit(
+    # Movement tracking must start only after approval.
+    # Draft / Submitted tickets must not pass forward to receiver tracking.
+    # Movement tracking must start only after Approval.
+    # Draft / Submitted tickets must not move into Barge Tracking.
+    if next_status == "Approved":
+        auto_create_barge_tracking_on_approval(
             db=db,
             transaction=transaction,
             current_user=current_user,
         )
 
-    if next_status == "Approved":
         create_tank_stock_ledger_from_approved_transaction(
             db=db,
             transaction=transaction,
