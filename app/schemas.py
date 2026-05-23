@@ -391,6 +391,277 @@ class TankOperationResponse(TankOperationBase):
 
     model_config = ConfigDict(from_attributes=True)
 
+# -------------------------
+# Vessel Operation Schemas
+# -------------------------
+
+class VesselOperationBase(BaseModel):
+    location_code: str
+    applicable_asset_type_code: str
+
+    operation_code: str
+    operation_label: str
+
+    operation_category: str
+    operation_sign: str
+    show_in: str = "Both"  # Entry / Tracking / Both
+
+    sort_order: int = 1
+    description: Optional[str] = None
+    status: str = "Active"
+
+
+class VesselOperationCreate(VesselOperationBase):
+    pass
+
+
+class VesselOperationResponse(VesselOperationBase):
+    id: int
+    location_name: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------
+# Vessel Stock Ledger Schemas
+# -------------------------
+
+class VesselStockLedgerResponse(BaseModel):
+    id: int
+    transaction_id: int
+
+    ticket_number: Optional[str] = None
+    operation_number: Optional[str] = None
+    status: str
+
+    location_code: str
+    location_name: Optional[str] = None
+
+    vessel_asset_code: str
+    vessel_asset_name: Optional[str] = None
+    vessel_asset_type_code: Optional[str] = None
+
+    operation_date: date
+    product_name: Optional[str] = None
+
+    movement_reference: Optional[str] = None
+
+    vessel_operation_code: Optional[str] = None
+    vessel_operation_label: Optional[str] = None
+    vessel_operation_category: Optional[str] = None
+    vessel_operation_sign: Optional[str] = None
+
+    qty_bbl: Optional[float] = 0
+    water_bbl: Optional[float] = 0
+    nsv_bbl: Optional[float] = 0
+
+    opening_stock: Optional[float] = 0
+    opening_water: Optional[float] = 0
+    closing_stock: Optional[float] = 0
+    closing_water: Optional[float] = 0
+    net_stock: Optional[float] = 0
+    net_water: Optional[float] = 0
+    net_nsv: Optional[float] = 0
+
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------
+# Movement Mapping Schemas
+# -------------------------
+
+class MovementMappingCreate(BaseModel):
+    mapping_type: str
+    location_code: str
+    reference_number: str
+    product_name: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class MovementMappingItemAddRequest(BaseModel):
+    role: str  # SOURCE / TARGET
+    transaction_ids: list[int]
+
+
+class MovementMappingItemResponse(BaseModel):
+    id: int
+    mapping_id: int
+    transaction_id: int
+    role: str
+
+    asset_code: Optional[str] = None
+    asset_type_code: Optional[str] = None
+
+    ticket_number: Optional[str] = None
+    operation_date: Optional[date] = None
+
+    qty_bbl: Optional[float] = 0
+    water_bbl: Optional[float] = 0
+    nsv_bbl: Optional[float] = 0
+
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MovementMappingComparisonResponse(BaseModel):
+    id: int
+    mapping_id: int
+
+    source_qty_bbl: Optional[float] = 0
+    source_water_bbl: Optional[float] = 0
+    source_nsv_bbl: Optional[float] = 0
+
+    target_qty_bbl: Optional[float] = 0
+    target_water_bbl: Optional[float] = 0
+    target_nsv_bbl: Optional[float] = 0
+
+    diff_nsv_bbl: Optional[float] = 0
+    diff_nsv_percent: Optional[float] = 0
+
+    summary_json: Optional[dict] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MovementMappingResponse(BaseModel):
+    id: int
+    mapping_type: str
+    location_code: str
+    reference_number: str
+    product_name: Optional[str] = None
+    status: str
+    remarks: Optional[str] = None
+
+    created_by: Optional[str] = None
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    items: list[MovementMappingItemResponse] = []
+    comparison: Optional[MovementMappingComparisonResponse] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+class ShuttleVoyageCloseRequest(BaseModel):
+    location_code: str
+    shuttle_number: str
+    shuttle_asset_code: str
+    closure_remarks: Optional[str] = None
+
+
+class ShuttleVoyageReopenRequest(BaseModel):
+    location_code: str
+    shuttle_number: str
+    shuttle_asset_code: str
+    remarks: Optional[str] = None
+
+
+class ShuttleVoyageResponse(BaseModel):
+    id: int
+    location_code: str
+    shuttle_number: str
+    shuttle_asset_code: str
+    status: str
+
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closure_remarks: Optional[str] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ShuttleTrackingTicketResponse(BaseModel):
+    transaction_id: int
+    ticket_number: Optional[str] = None
+    operation_number: Optional[str] = None
+
+    location_code: str
+    location_name: str
+
+    shuttle_number: str
+    shuttle_asset_code: str
+    shuttle_asset_name: str
+
+    product_name: Optional[str] = None
+    operation_date: Optional[date] = None
+    event_time: Optional[str] = None
+
+    opening_stock_bbl: float = 0
+    opening_water_bbl: float = 0
+    closing_stock_bbl: float = 0
+    closing_water_bbl: float = 0
+
+    net_stock_bbl: float = 0
+    net_water_bbl: float = 0
+
+    barge_reference: Optional[str] = None
+    remarks: Optional[str] = None
+
+    vessel_operation_code: Optional[str] = None
+    vessel_operation_label: Optional[str] = None
+    vessel_operation_category: Optional[str] = None
+    vessel_operation_sign: Optional[str] = None
+
+    tov_bbl: float = 0
+    free_water_bbl: float = 0
+    nsv_bbl: float = 0
+
+    status: str = ""
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ShuttleTrackingGroupResponse(BaseModel):
+    group_key: str
+
+    location_code: str
+    location_name: str
+
+    shuttle_number: str
+    shuttle_asset_code: str
+    shuttle_asset_name: str
+
+    voyage_status: str = "OPEN"
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closure_remarks: Optional[str] = None
+
+    total_tov_bbl: float = 0
+    total_free_water_bbl: float = 0
+    total_nsv_bbl: float = 0
+
+    tickets: list[ShuttleTrackingTicketResponse] = []
+
+
+class ShuttleTrackingResponse(BaseModel):
+    rows: list[ShuttleTrackingGroupResponse] = []
+    total_groups: int = 0
+
+    # ✅ NEW: pagination metadata
+    page: int = 1
+    page_size: int = 20
+    has_more: bool = False
 
 # -------------------------
 # Tank Stock Ledger Schemas
@@ -811,6 +1082,50 @@ class OperationTransactionResponse(OperationTransactionBase):
 
     model_config = ConfigDict(from_attributes=True)
 
+# -------------------------
+# Operation Transaction Register (Paged) Schemas
+# -------------------------
+
+class OperationTransactionRegisterRowResponse(BaseModel):
+    id: int
+    ticket_number: Optional[str] = None
+    operation_number: Optional[str] = None
+    convoy_number: Optional[str] = None
+
+    operation_date: Optional[date] = None
+
+    operation_type_id: Optional[int] = None
+    operation_type_code: Optional[str] = None
+    operation_type_name: Optional[str] = None
+
+    location_id: Optional[int] = None
+    location_code: Optional[str] = None
+    location_name: Optional[str] = None
+
+    primary_asset_id: Optional[int] = None
+    primary_asset_code: Optional[str] = None
+    primary_asset_name: Optional[str] = None
+
+    status: Optional[str] = None
+    field_count: int = 0
+    created_at: Optional[datetime] = None
+
+
+class OperationTransactionStatusCountResponse(BaseModel):
+    status: str
+    count: int
+
+
+class OperationTransactionRegisterPagedResponse(BaseModel):
+    rows: list[OperationTransactionRegisterRowResponse] = []
+    total_rows: int = 0
+
+    page: int = 1
+    page_size: int = 20
+    has_more: bool = False
+
+    status_counts: list[OperationTransactionStatusCountResponse] = []
+
 class OperationTransactionStatusHistoryResponse(BaseModel):
     id: int
     transaction_id: int
@@ -826,6 +1141,9 @@ class OperationTransactionStatusUpdate(BaseModel):
     status: str
     remarks: Optional[str] = None
     changed_by: Optional[str] = None
+
+    # ✅ Enterprise enforcement: must be true for Submitted/Approved
+    review_confirmed: Optional[bool] = False
 
 # -------------------------
 # Trip / Convoy Tracking Schemas

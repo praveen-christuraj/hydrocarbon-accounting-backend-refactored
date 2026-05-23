@@ -425,7 +425,6 @@ class TankOperation(Base):
         ),
     )
 
-
 class TankStockLedger(Base):
     __tablename__ = "tank_stock_ledger"
 
@@ -937,5 +936,239 @@ class BargeSealMaster(Base):
             "tank_id",
             "seal_position",
             name="unique_barge_seal_master_key",
+        ),
+    )
+
+class VesselOperation(Base):
+    __tablename__ = "vessel_operations"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    location_code = Column(String(50), nullable=False, index=True)
+    applicable_asset_type_code = Column(String(50), nullable=False, index=True)
+
+    operation_code = Column(String(50), nullable=False, index=True)
+    operation_label = Column(String(150), nullable=False)
+
+    operation_category = Column(String(50), nullable=False, index=True)
+    operation_sign = Column(String(20), nullable=False)  # IN / OUT / NEUTRAL / SET
+    show_in = Column(String(20), nullable=False, default="Both")
+
+    sort_order = Column(Integer, nullable=False, default=1)
+    description = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="Active")
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "location_code",
+            "applicable_asset_type_code",
+            "operation_code",
+            name="unique_vessel_operation_code_per_location_asset_type",
+        ),
+        UniqueConstraint(
+            "location_code",
+            "applicable_asset_type_code",
+            "operation_label",
+            name="unique_vessel_operation_label_per_location_asset_type",
+        ),
+    )
+
+
+class VesselStockLedger(Base):
+    """
+    Approved-only derived ledger for Shuttle Vessel / FSO (manual entry layouts).
+    One row per approved operation transaction (unique transaction_id).
+    """
+    __tablename__ = "vessel_stock_ledger"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    transaction_id = Column(
+        Integer,
+        ForeignKey("operation_transactions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        unique=True,
+    )
+
+    ticket_number = Column(String(120), nullable=True, index=True)
+    operation_number = Column(String(120), nullable=True, index=True)
+    status = Column(String(20), nullable=False, default="Approved")
+
+    location_code = Column(String(50), nullable=False, index=True)
+
+    vessel_asset_code = Column(String(80), nullable=False, index=True)
+    vessel_asset_name = Column(String(150), nullable=True)
+    vessel_asset_type_code = Column(String(50), nullable=True, index=True)
+
+    operation_date = Column(Date, nullable=False, index=True)
+    product_name = Column(String(150), nullable=True)
+
+    movement_reference = Column(String(120), nullable=True, index=True)
+
+    vessel_operation_code = Column(String(50), nullable=True, index=True)
+    vessel_operation_label = Column(String(150), nullable=True)
+    vessel_operation_category = Column(String(50), nullable=True, index=True)
+    vessel_operation_sign = Column(String(20), nullable=True)
+
+    # Vessel Cycle (manual)
+    qty_bbl = Column(Float, nullable=True, default=0)
+    water_bbl = Column(Float, nullable=True, default=0)
+    nsv_bbl = Column(Float, nullable=True, default=0)
+
+    # Stock Movement (manual)
+    opening_stock = Column(Float, nullable=True, default=0)
+    opening_water = Column(Float, nullable=True, default=0)
+    closing_stock = Column(Float, nullable=True, default=0)
+    closing_water = Column(Float, nullable=True, default=0)
+    net_stock = Column(Float, nullable=True, default=0)
+    net_water = Column(Float, nullable=True, default=0)
+    net_nsv = Column(Float, nullable=True, default=0)
+
+    created_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class MovementMapping(Base):
+    """
+    Enterprise mapping layer to link many-to-many:
+    Barge UNLOAD -> Shuttle Receipt -> FSO Receipt (etc.)
+    """
+    __tablename__ = "movement_mappings"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    mapping_type = Column(String(50), nullable=False, index=True)  # BARGE_TO_SHUTTLE, SHUTTLE_TO_FSO, etc.
+    location_code = Column(String(50), nullable=False, index=True)
+
+    reference_number = Column(String(120), nullable=False, index=True)  # Shuttle No / Batch / Voyage / etc.
+    product_name = Column(String(150), nullable=True)
+
+    status = Column(String(20), nullable=False, default="OPEN")  # OPEN/CLOSED
+
+    remarks = Column(Text, nullable=True)
+
+    created_by = Column(String(150), nullable=True)
+    closed_by = Column(String(150), nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "mapping_type",
+            "location_code",
+            "reference_number",
+            name="unique_mapping_per_type_location_reference",
+        ),
+    )
+
+
+class MovementMappingItem(Base):
+    __tablename__ = "movement_mapping_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    mapping_id = Column(
+        Integer,
+        ForeignKey("movement_mappings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    transaction_id = Column(
+        Integer,
+        ForeignKey("operation_transactions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    role = Column(String(20), nullable=False)  # SOURCE / TARGET
+
+    asset_code = Column(String(80), nullable=True, index=True)
+    asset_type_code = Column(String(50), nullable=True, index=True)
+
+    ticket_number = Column(String(120), nullable=True)
+    operation_date = Column(Date, nullable=True)
+
+    # Snapshot quantities at mapping time
+    qty_bbl = Column(Float, nullable=True, default=0)
+    water_bbl = Column(Float, nullable=True, default=0)
+    nsv_bbl = Column(Float, nullable=True, default=0)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "mapping_id",
+            "transaction_id",
+            name="unique_mapping_item_per_transaction",
+        ),
+    )
+
+
+class MovementMappingComparison(Base):
+    __tablename__ = "movement_mapping_comparisons"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    mapping_id = Column(
+        Integer,
+        ForeignKey("movement_mappings.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    source_qty_bbl = Column(Float, nullable=True, default=0)
+    source_water_bbl = Column(Float, nullable=True, default=0)
+    source_nsv_bbl = Column(Float, nullable=True, default=0)
+
+    target_qty_bbl = Column(Float, nullable=True, default=0)
+    target_water_bbl = Column(Float, nullable=True, default=0)
+    target_nsv_bbl = Column(Float, nullable=True, default=0)
+
+    diff_nsv_bbl = Column(Float, nullable=True, default=0)
+    diff_nsv_percent = Column(Float, nullable=True, default=0)
+
+    summary_json = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+class ShuttleVoyage(Base):
+    __tablename__ = "shuttle_voyages"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    location_code = Column(String(50), nullable=False, index=True)
+    shuttle_number = Column(String(80), nullable=False, index=True)  # stored in convoy_number on tickets
+    shuttle_asset_code = Column(String(80), nullable=False, index=True)
+
+    status = Column(String(20), nullable=False, default="OPEN")  # OPEN / CLOSED
+
+    created_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    closed_by = Column(String(150), nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    closure_remarks = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "location_code",
+            "shuttle_number",
+            "shuttle_asset_code",
+            name="unique_shuttle_voyage_key",
         ),
     )

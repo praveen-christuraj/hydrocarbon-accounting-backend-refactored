@@ -26,11 +26,12 @@ app.add_middleware(
 )
 
 from passlib.context import CryptContext
-from sqlalchemy import func, inspect, text
+from sqlalchemy import and_, func, inspect, literal, or_, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from fastapi.encoders import jsonable_encoder
+from sqlalchemy import func, text
+from sqlalchemy.orm import Session
 
 from app.database import Base, engine, get_db
 from app.models import (
@@ -52,6 +53,11 @@ from app.models import (
     OperationTransactionStatusHistory,
     OperationType,
     TankOperation,
+    VesselOperation,
+    VesselStockLedger,
+    MovementMapping,
+    MovementMappingItem,
+    MovementMappingComparison,
     TankStockLedger,
     TankerReceiptAcknowledgement,
     MaterialBalanceTemplate,
@@ -68,6 +74,7 @@ from app.models import (
     Trip,
     TripEvent,
     TripComparison,
+    ShuttleVoyage,
 )
 
 from app.schemas import (
@@ -102,11 +109,20 @@ from app.schemas import (
     OperationTemplateResponse,
     OperationTransactionCreate,
     OperationTransactionResponse,
+    OperationTransactionRegisterPagedResponse,
     OperationTransactionStatusUpdate,
     OperationTypeCreate,
     OperationTypeResponse,
     TankOperationCreate,
     TankOperationResponse,
+    VesselOperationCreate,
+    VesselOperationResponse,
+    VesselStockLedgerResponse,
+    MovementMappingCreate,
+    MovementMappingResponse,
+    MovementMappingItemAddRequest,
+    MovementMappingItemResponse,
+    MovementMappingComparisonResponse,
     TankStockLedgerResponse,
     TankStockLedgerSummaryResponse,
     TankStockLedgerDailySummaryResponse,
@@ -147,6 +163,12 @@ from app.schemas import (
     TripComparisonCreate,
     TripComparisonResponse,
     ConvoyTrackerResponse,
+    ShuttleTrackingResponse,
+    ShuttleTrackingGroupResponse,
+    ShuttleTrackingTicketResponse,
+    ShuttleVoyageCloseRequest,
+    ShuttleVoyageReopenRequest,
+    ShuttleVoyageResponse,
 )
 
 password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -655,13 +677,100 @@ def ensure_tanker_acknowledgement_closure_columns():
                 )
             )
 
+def ensure_vessel_operation_show_in_column():
+    inspector = inspect(engine)
+
+    if "vessel_operations" not in inspector.get_table_names():
+        return
+
+    cols = {c["name"] for c in inspector.get_columns("vessel_operations")}
+    if "show_in" in cols:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE vessel_operations ADD COLUMN show_in VARCHAR(20) DEFAULT 'Both';"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE vessel_operations SET show_in = 'Both' "
+                "WHERE show_in IS NULL OR TRIM(show_in) = '';"
+            )
+        )
+
+def ensure_barge_event_type_template_field():
+    """
+    Ensures Operation Templates used for BARGE Multi-Tank Before/After have
+    a manual field_code = 'barge_event_type' to store:
+    LOAD_1 / LOAD_2_TOPUP / UNLOAD / STS
+    """
+    db = Session(bind=engine)
+    try:
+        barge_op_codes = [
+            x.operation_type_code
+            for x in db.query(OperationType)
+            .filter(
+                OperationType.applicable_asset_type_code == "BARGE",
+                OperationType.status == "Active",
+            )
+            .all()
+        ]
+
+        if not barge_op_codes:
+            return
+
+        barge_templates = (
+            db.query(OperationTemplate)
+            .filter(
+                OperationTemplate.entry_layout_type == "Multi-Tank Before/After",
+                OperationTemplate.status == "Active",
+                OperationTemplate.operation_type_code.in_(barge_op_codes),
+            )
+            .all()
+        )
+
+        for t in barge_templates:
+            exists = (
+                db.query(OperationTemplateField)
+                .filter(
+                    OperationTemplateField.template_id == t.id,
+                    OperationTemplateField.field_code == "barge_event_type",
+                )
+                .first()
+            )
+
+            if exists:
+                continue
+
+            db.add(
+                OperationTemplateField(
+                    template_id=t.id,
+                    field_name="Barge Movement Stage",
+                    field_code="barge_event_type",
+                    field_group="Barge Tracking",
+                    data_type="Text",
+                    unit=None,
+                    is_required="No",
+                    input_mode="Manual",
+                    calculation_role="Input",
+                    sort_order=0,
+                    status="Active",
+                )
+            )
+
+        db.commit()
+    finally:
+        db.close()
 
 Base.metadata.create_all(bind=engine)
 ensure_operation_ticket_number_column()
 ensure_operation_template_layout_columns()
 ensure_tank_stock_ledger_accounting_columns()
 ensure_tank_stock_ledger_stock_snapshot_columns()
-ensure_tanker_acknowledgement_closure_columns()
+ensure_vessel_operation_show_in_column()
+ensure_barge_event_type_template_field()
 
 
 @app.get("/")
@@ -1725,6 +1834,46 @@ def seed_standard_permissions(
             "permission_name": "Manage Tank Operation",
             "module_name": "Operations",
             "description": "Can create, update, and delete location-wise tank operations",
+        },
+        # Vessel / FSO soft-coded operations
+        {
+            "permission_name": "View Vessel Operation",
+            "module_name": "Operations",
+            "description": "Can view Vessel Operation Master (soft-coded Loading/Unloading/STS/Decanting etc.)",
+        },
+        {
+            "permission_name": "Manage Vessel Operation",
+            "module_name": "Operations",
+            "description": "Can create, update, and delete Vessel Operation Master entries",
+        },
+
+        # Vessel Stock Ledger (Shuttle / FSO)
+        {
+            "permission_name": "View Vessel Stock Ledger",
+            "module_name": "Operations",
+            "description": "Can view Vessel Stock Ledger (approved-only derived ledger for Shuttle/FSO)",
+        },
+
+        # Movement Mapping (Barge ↔ Shuttle ↔ FSO reconciliation)
+        {
+            "permission_name": "View Movement Mapping",
+            "module_name": "Operations",
+            "description": "Can view Movement Mapping and reconciliation comparisons",
+        },
+        {
+            "permission_name": "Manage Movement Mapping",
+            "module_name": "Operations",
+            "description": "Can create/update/close Movement Mapping and attach approved tickets for reconciliation",
+        },
+        {
+            "permission_name": "View Shuttle Tracking",
+            "module_name": "Operations",
+            "description": "Can view Shuttle Tracking (Approved-only voyage tracking within location)",
+        },
+        {
+            "permission_name": "Manage Shuttle Tracking",
+            "module_name": "Operations",
+            "description": "Can close/reopen Shuttle voyages",
         },
         {
             "permission_name": "View Tank Stock Ledger",
@@ -5638,6 +5787,31 @@ def build_tank_operation_response(
         "updated_at": tank_operation.updated_at,
     }
 
+def build_vessel_operation_response(
+    vessel_operation: VesselOperation,
+    db: Session,
+):
+    location = (
+        db.query(Location)
+        .filter(Location.location_code.ilike(vessel_operation.location_code))
+        .first()
+    )
+
+    return {
+        "id": vessel_operation.id,
+        "location_code": vessel_operation.location_code,
+        "location_name": location.location_name if location else "",
+        "applicable_asset_type_code": vessel_operation.applicable_asset_type_code,
+        "operation_code": vessel_operation.operation_code,
+        "operation_label": vessel_operation.operation_label,
+        "operation_category": vessel_operation.operation_category,
+        "operation_sign": vessel_operation.operation_sign,
+        "sort_order": vessel_operation.sort_order,
+        "description": vessel_operation.description,
+        "status": vessel_operation.status,
+        "created_at": vessel_operation.created_at,
+        "updated_at": vessel_operation.updated_at,
+    }
 
 def build_tank_operation_audit_snapshot(
     tank_operation: TankOperation,
@@ -5771,6 +5945,87 @@ def validate_tank_operation(
         "operation_sign": operation_sign,
     }
 
+def validate_vessel_operation(
+    vessel_operation: VesselOperationCreate,
+    db: Session,
+    vessel_operation_id: int | None = None,
+):
+    location_code = normalize_code(vessel_operation.location_code)
+    asset_type_code = normalize_code(vessel_operation.applicable_asset_type_code)
+
+    operation_code = normalize_code(vessel_operation.operation_code)
+    operation_label = str(vessel_operation.operation_label or "").strip()
+
+    operation_category = normalize_code(vessel_operation.operation_category)
+    operation_sign = normalize_code(vessel_operation.operation_sign)
+
+    if location_code == "":
+        raise HTTPException(status_code=400, detail="Location is required")
+
+    if asset_type_code == "":
+        raise HTTPException(status_code=400, detail="Applicable Asset Type is required")
+
+    if operation_code == "":
+        raise HTTPException(status_code=400, detail="Operation Code is required")
+
+    if operation_label == "":
+        raise HTTPException(status_code=400, detail="Operation Label is required")
+
+    if operation_category == "":
+        raise HTTPException(status_code=400, detail="Operation Category is required")
+
+    if operation_sign not in ["IN", "OUT", "NEUTRAL", "SET"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Operation Sign must be IN / OUT / NEUTRAL / SET",
+        )
+
+    location = (
+        db.query(Location)
+        .filter(Location.location_code.ilike(location_code))
+        .first()
+    )
+    if not location:
+        raise HTTPException(status_code=400, detail="Location not found")
+
+    asset_type = (
+        db.query(AssetType)
+        .filter(AssetType.asset_type_code.ilike(asset_type_code))
+        .first()
+    )
+    if not asset_type:
+        raise HTTPException(status_code=400, detail="Asset Type not found")
+
+    # Unique checks (code + label)
+    code_q = db.query(VesselOperation).filter(
+        VesselOperation.location_code.ilike(location_code),
+        VesselOperation.applicable_asset_type_code.ilike(asset_type_code),
+        VesselOperation.operation_code.ilike(operation_code),
+    )
+    label_q = db.query(VesselOperation).filter(
+        VesselOperation.location_code.ilike(location_code),
+        VesselOperation.applicable_asset_type_code.ilike(asset_type_code),
+        VesselOperation.operation_label.ilike(operation_label),
+    )
+
+    if vessel_operation_id:
+        code_q = code_q.filter(VesselOperation.id != vessel_operation_id)
+        label_q = label_q.filter(VesselOperation.id != vessel_operation_id)
+
+    if code_q.first():
+        raise HTTPException(status_code=400, detail="Operation Code already exists")
+
+    if label_q.first():
+        raise HTTPException(status_code=400, detail="Operation Label already exists")
+
+    return {
+        "location_code": location_code,
+        "asset_type_code": asset_type_code,
+        "operation_code": operation_code,
+        "operation_label": operation_label,
+        "operation_category": operation_category,
+        "operation_sign": operation_sign,
+    }
 
 @app.get(
     "/tank-operations",
@@ -6013,6 +6268,773 @@ def delete_tank_operation(
         "message": "Tank operation deleted successfully"
     }
 
+# -------------------------
+# Vessel Operation Master APIs
+# -------------------------
+
+VALID_VESSEL_OPERATION_SIGNS = ["SET", "IN", "OUT", "NEUTRAL"]
+
+def build_vessel_operation_response(vessel_operation: VesselOperation, db: Session):
+    location = (
+        db.query(Location)
+        .filter(Location.location_code.ilike(vessel_operation.location_code))
+        .first()
+    )
+
+    return {
+        "id": vessel_operation.id,
+        "location_code": vessel_operation.location_code,
+        "location_name": location.location_name if location else "",
+        "applicable_asset_type_code": vessel_operation.applicable_asset_type_code,
+        "operation_code": vessel_operation.operation_code,
+        "operation_label": vessel_operation.operation_label,
+        "operation_category": vessel_operation.operation_category,
+        "operation_sign": vessel_operation.operation_sign,
+        "show_in": vessel_operation.show_in,
+        "sort_order": vessel_operation.sort_order,
+        "description": vessel_operation.description,
+        "status": vessel_operation.status,
+        "created_at": vessel_operation.created_at,
+        "updated_at": vessel_operation.updated_at,
+    }
+
+def validate_vessel_operation(v: VesselOperationCreate, db: Session, vessel_operation_id: int | None = None):
+    location_code = normalize_code(v.location_code)
+    asset_type_code = normalize_code(v.applicable_asset_type_code)
+    operation_code = normalize_code(v.operation_code)
+
+    operation_label = str(v.operation_label or "").strip()
+    operation_category = normalize_code(v.operation_category)
+    operation_sign = normalize_code(v.operation_sign)
+
+    if not location_code:
+        raise HTTPException(status_code=400, detail="Location is required")
+    if not asset_type_code:
+        raise HTTPException(status_code=400, detail="Applicable Asset Type is required")
+    if not operation_code:
+        raise HTTPException(status_code=400, detail="Operation Code is required")
+    if not operation_label:
+        raise HTTPException(status_code=400, detail="Operation Label is required")
+    if not operation_category:
+        raise HTTPException(status_code=400, detail="Operation Category is required")
+    if operation_sign not in VALID_VESSEL_OPERATION_SIGNS:
+        raise HTTPException(status_code=400, detail="Operation Sign must be SET / IN / OUT / NEUTRAL")
+
+    show_in_raw = str(getattr(v, "show_in", "") or "").strip()
+    if show_in_raw == "":
+        show_in_raw = "Both"
+
+    show_in = show_in_raw[:1].upper() + show_in_raw[1:].lower()
+    if show_in not in ["Entry", "Tracking", "Both"]:
+        raise HTTPException(status_code=400, detail="Show In must be Entry / Tracking / Both")
+
+    if not db.query(Location).filter(Location.location_code.ilike(location_code)).first():
+        raise HTTPException(status_code=400, detail="Location not found")
+
+    if not db.query(AssetType).filter(AssetType.asset_type_code.ilike(asset_type_code)).first():
+        raise HTTPException(status_code=400, detail="Asset Type not found")
+
+    code_q = db.query(VesselOperation).filter(
+        VesselOperation.location_code.ilike(location_code),
+        VesselOperation.applicable_asset_type_code.ilike(asset_type_code),
+        VesselOperation.operation_code.ilike(operation_code),
+    )
+    label_q = db.query(VesselOperation).filter(
+        VesselOperation.location_code.ilike(location_code),
+        VesselOperation.applicable_asset_type_code.ilike(asset_type_code),
+        VesselOperation.operation_label.ilike(operation_label),
+    )
+
+    if vessel_operation_id:
+        code_q = code_q.filter(VesselOperation.id != vessel_operation_id)
+        label_q = label_q.filter(VesselOperation.id != vessel_operation_id)
+
+    if code_q.first():
+        raise HTTPException(status_code=400, detail="Operation Code already exists")
+    if label_q.first():
+        raise HTTPException(status_code=400, detail="Operation Label already exists")
+
+    return {
+        "location_code": location_code,
+        "asset_type_code": asset_type_code,
+        "operation_code": operation_code,
+        "operation_label": operation_label,
+        "operation_category": operation_category,
+        "operation_sign": operation_sign,
+        "show_in": show_in,
+    }
+
+@app.get("/vessel-operations", response_model=list[VesselOperationResponse])
+def get_vessel_operations(
+    location_code: str | None = None,
+    applicable_asset_type_code: str | None = None,
+    status: str | None = None,
+    show_in: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Vessel Operation", db)
+
+    q = db.query(VesselOperation)
+
+    lc = clean_optional_text(location_code)
+    if lc:
+        q = q.filter(VesselOperation.location_code.ilike(lc))
+
+    at = clean_optional_text(applicable_asset_type_code)
+    if at:
+        q = q.filter(VesselOperation.applicable_asset_type_code.ilike(at))
+
+    st = clean_optional_text(status)
+    if st:
+        q = q.filter(VesselOperation.status == st)
+
+    si = clean_optional_text(show_in)
+    if si:
+        normalized = si[:1].upper() + si[1:].lower()
+        if normalized == "Entry":
+            q = q.filter(VesselOperation.show_in.in_(["Entry", "Both"]))
+        elif normalized == "Tracking":
+            q = q.filter(VesselOperation.show_in.in_(["Tracking", "Both"]))
+        elif normalized == "Both":
+            q = q.filter(VesselOperation.show_in == "Both")
+
+    rows = q.order_by(
+        VesselOperation.location_code.asc(),
+        VesselOperation.applicable_asset_type_code.asc(),
+        VesselOperation.sort_order.asc(),
+        VesselOperation.operation_label.asc(),
+    ).all()
+
+    return [build_vessel_operation_response(r, db) for r in rows]
+
+@app.post("/vessel-operations", response_model=VesselOperationResponse)
+def create_vessel_operation(
+    vessel_operation: VesselOperationCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Vessel Operation", db)
+
+    d = validate_vessel_operation(vessel_operation, db)
+
+    row = VesselOperation(
+        location_code=d["location_code"],
+        applicable_asset_type_code=d["asset_type_code"],
+        operation_code=d["operation_code"],
+        operation_label=d["operation_label"],
+        operation_category=d["operation_category"],
+        operation_sign=d["operation_sign"],
+        show_in=d["show_in"],
+        sort_order=vessel_operation.sort_order or 1,
+        description=clean_optional_text(vessel_operation.description),
+        status=vessel_operation.status or "Active",
+    )
+
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return build_vessel_operation_response(row, db)
+
+@app.put("/vessel-operations/{vessel_operation_id}", response_model=VesselOperationResponse)
+def update_vessel_operation(
+    vessel_operation_id: int,
+    vessel_operation: VesselOperationCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Vessel Operation", db)
+
+    existing = db.query(VesselOperation).filter(VesselOperation.id == vessel_operation_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Vessel operation not found")
+
+    d = validate_vessel_operation(vessel_operation, db, vessel_operation_id)
+
+    existing.location_code = d["location_code"]
+    existing.applicable_asset_type_code = d["asset_type_code"]
+    existing.operation_code = d["operation_code"]
+    existing.operation_label = d["operation_label"]
+    existing.operation_category = d["operation_category"]
+    existing.operation_sign = d["operation_sign"]
+    existing.show_in = d["show_in"]
+    existing.sort_order = vessel_operation.sort_order or 1
+    existing.description = clean_optional_text(vessel_operation.description)
+    existing.status = vessel_operation.status or "Active"
+    existing.updated_at = datetime.now()
+
+    db.commit()
+    db.refresh(existing)
+    return build_vessel_operation_response(existing, db)
+
+@app.delete("/vessel-operations/{vessel_operation_id}")
+def delete_vessel_operation(
+    vessel_operation_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Vessel Operation", db)
+
+    existing = db.query(VesselOperation).filter(VesselOperation.id == vessel_operation_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Vessel operation not found")
+
+    db.delete(existing)
+    db.commit()
+    return {"message": "Vessel operation deleted successfully"}
+
+# -------------------------
+# Vessel Stock Ledger (Approved-only) APIs
+# -------------------------
+
+def get_value_text(db: Session, transaction_id: int, field_code: str):
+    row = (
+        db.query(OperationTransactionValue)
+        .filter(
+            OperationTransactionValue.transaction_id == transaction_id,
+            OperationTransactionValue.field_code == field_code,
+        )
+        .first()
+    )
+    if not row:
+        return None
+    if row.field_value is None:
+        return None
+    if isinstance(row.field_value, (dict, list)):
+        return row.field_value
+    return str(row.field_value).strip()
+
+
+def extract_multitank_net(payload: dict):
+    net = (((payload or {}).get("calculated") or {}).get("net") or {})
+    qty = safe_float(net.get("TOV"))
+    water = safe_float(net.get("FW"))
+    nsv = safe_float(net.get("NSV"))
+    # mapping/ledger should use positive magnitudes
+    return abs(qty), abs(water), abs(nsv)
+
+
+def create_or_update_vessel_stock_ledger_from_approved_transaction(
+    db: Session,
+    transaction: OperationTransaction,
+    current_user: User,
+):
+    if transaction.status != "Approved":
+        return None
+
+    template = (
+        db.query(OperationTemplate)
+        .filter(OperationTemplate.id == transaction.operation_template_id)
+        .first()
+    )
+    if not template:
+        return None
+
+    layout = str(template.entry_layout_type or "").strip()
+
+    if layout not in ["Vessel Cycle", "Stock Movement"]:
+        return None
+
+    asset = (
+        db.query(Asset)
+        .filter(Asset.asset_code.ilike(transaction.primary_asset_code))
+        .first()
+    )
+    if not asset:
+        return None
+
+    created_by = (
+        f"{current_user.full_name} ({current_user.username})"
+        if current_user.full_name
+        else current_user.username
+    )
+
+    # Resolve operation code from values
+    vessel_operation_code = get_value_text(db, transaction.id, "vessel_operation_code")
+    vessel_operation_code = clean_optional_text(vessel_operation_code if isinstance(vessel_operation_code, str) else "")
+
+    # Reference
+    movement_reference = (
+        get_value_text(db, transaction.id, "movement_reference")
+        or get_value_text(db, transaction.id, "shuttle_number")
+        or get_value_text(db, transaction.id, "reference_number")
+    )
+    movement_reference = clean_optional_text(movement_reference if isinstance(movement_reference, str) else "")
+
+    # Quantities
+    qty_bbl = water_bbl = nsv_bbl = 0
+    opening_stock = opening_water = closing_stock = closing_water = 0
+    net_stock = net_water = net_nsv = 0
+
+    if layout == "Vessel Cycle":
+        qty_bbl = safe_float(get_value_text(db, transaction.id, "quantity_bbl") or get_value_text(db, transaction.id, "gross_qty_bbl"))
+        water_bbl = safe_float(get_value_text(db, transaction.id, "water_bbl"))
+        nsv_bbl = safe_float(get_value_text(db, transaction.id, "nsv_bbl"))
+    else:
+        opening_stock = safe_float(get_value_text(db, transaction.id, "opening_stock"))
+        opening_water = safe_float(get_value_text(db, transaction.id, "opening_water"))
+        closing_stock = safe_float(get_value_text(db, transaction.id, "closing_stock"))
+        closing_water = safe_float(get_value_text(db, transaction.id, "closing_water"))
+
+        net_stock = safe_float(get_value_text(db, transaction.id, "net_stock")) or (closing_stock - opening_stock)
+        net_water = safe_float(get_value_text(db, transaction.id, "net_water")) or (closing_water - opening_water)
+        net_nsv = safe_float(get_value_text(db, transaction.id, "net_nsv")) or (net_stock - net_water)
+
+        qty_bbl = net_stock
+        water_bbl = net_water
+        nsv_bbl = net_nsv
+
+    # Lookup soft-coded vessel operation details (optional but recommended)
+    vessel_op = None
+    if vessel_operation_code:
+        vessel_op = (
+            db.query(VesselOperation)
+            .filter(
+                VesselOperation.location_code.ilike(transaction.origin_location_code),
+                VesselOperation.applicable_asset_type_code.ilike(asset.asset_type_code),
+                VesselOperation.operation_code.ilike(vessel_operation_code),
+                VesselOperation.status == "Active",
+            )
+            .first()
+        )
+
+    ledger = (
+        db.query(VesselStockLedger)
+        .filter(VesselStockLedger.transaction_id == transaction.id)
+        .first()
+    )
+
+    if not ledger:
+        ledger = VesselStockLedger(transaction_id=transaction.id)
+        db.add(ledger)
+
+    ledger.ticket_number = get_transaction_ticket_number(transaction)
+    ledger.operation_number = transaction.operation_number
+    ledger.status = transaction.status
+
+    ledger.location_code = transaction.origin_location_code
+
+    ledger.vessel_asset_code = asset.asset_code
+    ledger.vessel_asset_name = asset.asset_name
+    ledger.vessel_asset_type_code = asset.asset_type_code
+
+    ledger.operation_date = transaction.operation_date
+    ledger.product_name = transaction.product_name
+
+    ledger.movement_reference = movement_reference
+
+    ledger.vessel_operation_code = vessel_operation_code
+    ledger.vessel_operation_label = vessel_op.operation_label if vessel_op else vessel_operation_code
+    ledger.vessel_operation_category = vessel_op.operation_category if vessel_op else None
+    ledger.vessel_operation_sign = vessel_op.operation_sign if vessel_op else None
+
+    ledger.qty_bbl = qty_bbl
+    ledger.water_bbl = water_bbl
+    ledger.nsv_bbl = nsv_bbl
+
+    ledger.opening_stock = opening_stock
+    ledger.opening_water = opening_water
+    ledger.closing_stock = closing_stock
+    ledger.closing_water = closing_water
+    ledger.net_stock = net_stock
+    ledger.net_water = net_water
+    ledger.net_nsv = net_nsv
+
+    ledger.created_by = ledger.created_by or created_by
+    ledger.updated_at = datetime.now()
+
+    db.flush()
+
+    return ledger
+
+
+@app.get("/vessel-stock-ledger", response_model=list[VesselStockLedgerResponse])
+def get_vessel_stock_ledger(
+    location_code: str | None = None,
+    vessel_asset_code: str | None = None,
+    reference_number: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Transaction", db)
+
+    query = db.query(VesselStockLedger)
+
+    lc = clean_optional_text(location_code)
+    if lc:
+        query = query.filter(VesselStockLedger.location_code.ilike(lc))
+
+    ac = clean_optional_text(vessel_asset_code)
+    if ac:
+        query = query.filter(VesselStockLedger.vessel_asset_code.ilike(ac))
+
+    ref = clean_optional_text(reference_number)
+    if ref:
+        query = query.filter(VesselStockLedger.movement_reference.ilike(ref))
+
+    if clean_optional_text(date_from):
+        query = query.filter(VesselStockLedger.operation_date >= date.fromisoformat(date_from))
+
+    if clean_optional_text(date_to):
+        query = query.filter(VesselStockLedger.operation_date <= date.fromisoformat(date_to))
+
+    rows = query.order_by(VesselStockLedger.operation_date.desc(), VesselStockLedger.id.desc()).all()
+
+    # attach location_name
+    loc_map = {l.location_code: l.location_name for l in db.query(Location).all()}
+
+    results = []
+    for r in rows:
+        item = r.__dict__.copy()
+        item["location_name"] = loc_map.get(r.location_code, "")
+        results.append(item)
+
+    return results
+
+# -------------------------
+# Movement Mapping + Comparison APIs
+# -------------------------
+
+def extract_transaction_quantities(db: Session, transaction: OperationTransaction):
+    # Multi-tank payload (barges)
+    payload_row = (
+        db.query(OperationTransactionValue)
+        .filter(
+            OperationTransactionValue.transaction_id == transaction.id,
+            OperationTransactionValue.field_code == "multi_tank_payload",
+        )
+        .first()
+    )
+
+    if payload_row and isinstance(payload_row.field_value, dict):
+        net = (((payload_row.field_value or {}).get("calculated") or {}).get("net") or {})
+        qty = abs(safe_float(net.get("TOV")))
+        water = abs(safe_float(net.get("FW")))
+        nsv = abs(safe_float(net.get("NSV")))
+        return qty, water, nsv
+
+    # ✅ Shuttle payload (Shuttle Tracking)
+    payload_row = (
+        db.query(OperationTransactionValue)
+        .filter(
+            OperationTransactionValue.transaction_id == transaction.id,
+            OperationTransactionValue.field_code == "shuttle_payload",
+        )
+        .first()
+    )
+
+    if payload_row and isinstance(payload_row.field_value, dict):
+        net = (((payload_row.field_value or {}).get("calculated") or {}).get("net") or {})
+        qty = abs(safe_float(net.get("TOV")))
+        water = abs(safe_float(net.get("FW")))
+        nsv = abs(safe_float(net.get("NSV")))
+        return qty, water, nsv
+
+    # Vessel Cycle manual
+    def get_val(code):
+        row = (
+            db.query(OperationTransactionValue)
+            .filter(
+                OperationTransactionValue.transaction_id == transaction.id,
+                OperationTransactionValue.field_code == code,
+            )
+            .first()
+        )
+        if not row:
+            return None
+        return row.field_value
+
+    qty = safe_float(get_val("quantity_bbl") or get_val("gross_qty_bbl"))
+    water = safe_float(get_val("water_bbl"))
+    nsv = safe_float(get_val("nsv_bbl"))
+    if qty or water or nsv:
+        return abs(qty), abs(water), abs(nsv)
+
+    # Stock Movement manual (net)
+    net_stock = safe_float(get_val("net_stock"))
+    net_water = safe_float(get_val("net_water"))
+    net_nsv = safe_float(get_val("net_nsv"))
+    if net_stock or net_water or net_nsv:
+        return abs(net_stock), abs(net_water), abs(net_nsv)
+
+    return 0, 0, 0
+
+
+def recompute_mapping_comparison(db: Session, mapping_id: int):
+    items = db.query(MovementMappingItem).filter(MovementMappingItem.mapping_id == mapping_id).all()
+
+    source = [i for i in items if str(i.role).upper() == "SOURCE"]
+    target = [i for i in items if str(i.role).upper() == "TARGET"]
+
+    source_qty = sum(safe_float(i.qty_bbl) for i in source)
+    source_water = sum(safe_float(i.water_bbl) for i in source)
+    source_nsv = sum(safe_float(i.nsv_bbl) for i in source)
+
+    target_qty = sum(safe_float(i.qty_bbl) for i in target)
+    target_water = sum(safe_float(i.water_bbl) for i in target)
+    target_nsv = sum(safe_float(i.nsv_bbl) for i in target)
+
+    diff_nsv = target_nsv - source_nsv
+    diff_pct = (diff_nsv / source_nsv * 100) if source_nsv else 0
+
+    summary = {
+        "source": {"qty_bbl": source_qty, "water_bbl": source_water, "nsv_bbl": source_nsv},
+        "target": {"qty_bbl": target_qty, "water_bbl": target_water, "nsv_bbl": target_nsv},
+        "diff": {"nsv_bbl": diff_nsv, "nsv_percent": diff_pct},
+    }
+
+    cmp_row = db.query(MovementMappingComparison).filter(MovementMappingComparison.mapping_id == mapping_id).first()
+    if not cmp_row:
+        cmp_row = MovementMappingComparison(mapping_id=mapping_id)
+        db.add(cmp_row)
+
+    cmp_row.source_qty_bbl = source_qty
+    cmp_row.source_water_bbl = source_water
+    cmp_row.source_nsv_bbl = source_nsv
+
+    cmp_row.target_qty_bbl = target_qty
+    cmp_row.target_water_bbl = target_water
+    cmp_row.target_nsv_bbl = target_nsv
+
+    cmp_row.diff_nsv_bbl = diff_nsv
+    cmp_row.diff_nsv_percent = diff_pct
+
+    cmp_row.summary_json = summary
+    cmp_row.updated_at = datetime.now()
+
+    db.flush()
+    return cmp_row
+
+
+def build_mapping_response(db: Session, mapping: MovementMapping):
+    items = db.query(MovementMappingItem).filter(MovementMappingItem.mapping_id == mapping.id).order_by(MovementMappingItem.id.asc()).all()
+    cmp_row = db.query(MovementMappingComparison).filter(MovementMappingComparison.mapping_id == mapping.id).first()
+
+    return {
+        "id": mapping.id,
+        "mapping_type": mapping.mapping_type,
+        "location_code": mapping.location_code,
+        "reference_number": mapping.reference_number,
+        "product_name": mapping.product_name,
+        "status": mapping.status,
+        "remarks": mapping.remarks,
+        "created_by": mapping.created_by,
+        "closed_by": mapping.closed_by,
+        "closed_at": mapping.closed_at,
+        "created_at": mapping.created_at,
+        "updated_at": mapping.updated_at,
+        "items": items,
+        "comparison": cmp_row,
+    }
+
+
+@app.get("/movement-mappings", response_model=list[MovementMappingResponse])
+def list_movement_mappings(
+    mapping_type: str | None = None,
+    location_code: str | None = None,
+    reference_number: str | None = None,
+    status: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Movement Mapping", db)
+
+    q = db.query(MovementMapping)
+
+    if clean_optional_text(mapping_type):
+        q = q.filter(MovementMapping.mapping_type.ilike(mapping_type))
+
+    if clean_optional_text(location_code):
+        q = q.filter(MovementMapping.location_code.ilike(location_code))
+
+    if clean_optional_text(reference_number):
+        q = q.filter(MovementMapping.reference_number.ilike(reference_number))
+
+    if clean_optional_text(status):
+        q = q.filter(MovementMapping.status.ilike(status))
+
+    rows = q.order_by(MovementMapping.created_at.desc(), MovementMapping.id.desc()).all()
+    return [build_mapping_response(db, r) for r in rows]
+
+
+@app.get("/movement-mappings/{mapping_id}", response_model=MovementMappingResponse)
+def get_movement_mapping(
+    mapping_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Movement Mapping", db)
+
+    m = db.query(MovementMapping).filter(MovementMapping.id == mapping_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+
+    return build_mapping_response(db, m)
+
+
+@app.post("/movement-mappings", response_model=MovementMappingResponse)
+def create_movement_mapping(
+    request: MovementMappingCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Movement Mapping", db)
+
+    created_by = (
+        f"{current_user.full_name} ({current_user.username})"
+        if current_user.full_name
+        else current_user.username
+    )
+
+    m = MovementMapping(
+        mapping_type=normalize_code(request.mapping_type),
+        location_code=normalize_code(request.location_code),
+        reference_number=str(request.reference_number or "").strip(),
+        product_name=clean_optional_text(request.product_name),
+        remarks=clean_optional_text(request.remarks),
+        status="OPEN",
+        created_by=created_by,
+        updated_at=datetime.now(),
+    )
+
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+
+    return build_mapping_response(db, m)
+
+
+@app.post("/movement-mappings/{mapping_id}/items", response_model=MovementMappingResponse)
+def add_mapping_items(
+    mapping_id: int,
+    request: MovementMappingItemAddRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Movement Mapping", db)
+
+    mapping = db.query(MovementMapping).filter(MovementMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+
+    if str(mapping.status).upper() == "CLOSED":
+        raise HTTPException(status_code=400, detail="Mapping is CLOSED")
+
+    role = normalize_code(request.role)
+    if role not in ["SOURCE", "TARGET"]:
+        raise HTTPException(status_code=400, detail="role must be SOURCE or TARGET")
+
+    for tid in request.transaction_ids:
+        tx = db.query(OperationTransaction).filter(OperationTransaction.id == tid).first()
+        if not tx:
+            raise HTTPException(status_code=404, detail=f"Transaction {tid} not found")
+
+        if tx.status != "Approved":
+            raise HTTPException(status_code=400, detail=f"Only Approved transactions can be mapped (ticket {tid})")
+
+        exists = db.query(MovementMappingItem).filter(
+            MovementMappingItem.mapping_id == mapping_id,
+            MovementMappingItem.transaction_id == tid,
+        ).first()
+        if exists:
+            continue
+
+        qty, water, nsv = extract_transaction_quantities(db, tx)
+
+        asset_type_code = None
+        asset = db.query(Asset).filter(Asset.asset_code.ilike(tx.primary_asset_code)).first()
+        if asset:
+            asset_type_code = asset.asset_type_code
+
+        item = MovementMappingItem(
+            mapping_id=mapping_id,
+            transaction_id=tid,
+            role=role,
+            asset_code=tx.primary_asset_code,
+            asset_type_code=asset_type_code,
+            ticket_number=get_transaction_ticket_number(tx),
+            operation_date=tx.operation_date,
+            qty_bbl=qty,
+            water_bbl=water,
+            nsv_bbl=nsv,
+        )
+        db.add(item)
+
+    db.flush()
+    recompute_mapping_comparison(db, mapping_id)
+
+    mapping.updated_at = datetime.now()
+    db.commit()
+    db.refresh(mapping)
+
+    return build_mapping_response(db, mapping)
+
+
+@app.delete("/movement-mappings/{mapping_id}/items/{item_id}", response_model=MovementMappingResponse)
+def remove_mapping_item(
+    mapping_id: int,
+    item_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Movement Mapping", db)
+
+    mapping = db.query(MovementMapping).filter(MovementMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+
+    if str(mapping.status).upper() == "CLOSED":
+        raise HTTPException(status_code=400, detail="Mapping is CLOSED")
+
+    item = db.query(MovementMappingItem).filter(
+        MovementMappingItem.id == item_id,
+        MovementMappingItem.mapping_id == mapping_id,
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    db.delete(item)
+    db.flush()
+
+    recompute_mapping_comparison(db, mapping_id)
+
+    mapping.updated_at = datetime.now()
+    db.commit()
+    db.refresh(mapping)
+
+    return build_mapping_response(db, mapping)
+
+
+@app.post("/movement-mappings/{mapping_id}/close", response_model=MovementMappingResponse)
+def close_mapping(
+    mapping_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Movement Mapping", db)
+
+    mapping = db.query(MovementMapping).filter(MovementMapping.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+
+    if str(mapping.status).upper() == "CLOSED":
+        return build_mapping_response(db, mapping)
+
+    mapping.status = "CLOSED"
+    mapping.closed_by = (
+        f"{current_user.full_name} ({current_user.username})"
+        if current_user.full_name
+        else current_user.username
+    )
+    mapping.closed_at = datetime.now()
+    mapping.updated_at = datetime.now()
+
+    db.commit()
+    db.refresh(mapping)
+
+    return build_mapping_response(db, mapping)
 
 # -------------------------
 # Tank Stock Ledger APIs
@@ -8851,6 +9873,241 @@ def get_operation_transactions(
 
     return result
 
+from sqlalchemy.orm import aliased
+
+@app.get(
+    "/operation-transactions/paged",
+    response_model=OperationTransactionRegisterPagedResponse,
+)
+def get_operation_transactions_paged(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    operation_type_id: int | None = None,
+    operation_type_code: str | None = None,
+    location_id: int | None = None,
+    location_code: str | None = None,
+    asset_id: int | None = None,
+    asset_code: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Transaction", db)
+
+    # Guardrails
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 1
+    if page_size > 200:
+        page_size = 200
+
+    resolved_operation_type_code = clean_optional_text(operation_type_code)
+    resolved_location_code = clean_optional_text(location_code)
+    resolved_asset_code = clean_optional_text(asset_code)
+    resolved_search = clean_optional_text(search)
+    resolved_status = clean_optional_text(status)
+
+    # Resolve IDs -> codes (same behavior as existing filter helper)
+    if operation_type_id:
+        op = (
+            db.query(OperationType)
+            .filter(OperationType.id == operation_type_id)
+            .first()
+        )
+        if op:
+            resolved_operation_type_code = op.operation_type_code
+
+    if location_id:
+        loc = db.query(Location).filter(Location.id == location_id).first()
+        if loc:
+            resolved_location_code = loc.location_code
+
+    if asset_id:
+        ast = db.query(Asset).filter(Asset.id == asset_id).first()
+        if ast:
+            resolved_asset_code = ast.asset_code
+
+    # Aliases (avoid any ambiguous join issues later)
+    OT = aliased(OperationType)
+    LOC = aliased(Location)
+    AST = aliased(Asset)
+
+    # Field count subquery
+    value_count_subq = (
+        db.query(
+            OperationTransactionValue.transaction_id.label("tx_id"),
+            func.count(OperationTransactionValue.id).label("field_count"),
+        )
+        .group_by(OperationTransactionValue.transaction_id)
+        .subquery()
+    )
+
+    base_query = (
+        db.query(
+            OperationTransaction.id.label("id"),
+            OperationTransaction.operation_number.label("operation_number"),
+            OperationTransaction.operation_ticket_number.label("operation_ticket_number"),
+            OperationTransaction.convoy_number.label("convoy_number"),
+            OperationTransaction.operation_date.label("operation_date"),
+            OperationTransaction.operation_type_code.label("operation_type_code"),
+            OperationTransaction.origin_location_code.label("origin_location_code"),
+            OperationTransaction.primary_asset_code.label("primary_asset_code"),
+            OperationTransaction.status.label("status"),
+            OperationTransaction.created_at.label("created_at"),
+            OT.id.label("operation_type_id"),
+            OT.operation_type_name.label("operation_type_name"),
+            LOC.id.label("location_id"),
+            LOC.location_name.label("location_name"),
+            AST.id.label("asset_id"),
+            AST.asset_name.label("asset_name"),
+            func.coalesce(value_count_subq.c.field_count, 0).label("field_count"),
+        )
+        .outerjoin(OT, OT.operation_type_code == OperationTransaction.operation_type_code)
+        .outerjoin(LOC, LOC.location_code == OperationTransaction.origin_location_code)
+        .outerjoin(AST, AST.asset_code == OperationTransaction.primary_asset_code)
+        .outerjoin(value_count_subq, value_count_subq.c.tx_id == OperationTransaction.id)
+    )
+
+    # Filters
+    if date_from:
+        base_query = base_query.filter(OperationTransaction.operation_date >= date_from)
+
+    if date_to:
+        base_query = base_query.filter(OperationTransaction.operation_date <= date_to)
+
+    if resolved_operation_type_code:
+        base_query = base_query.filter(
+            OperationTransaction.operation_type_code.ilike(resolved_operation_type_code)
+        )
+
+    if resolved_location_code:
+        base_query = base_query.filter(
+            OperationTransaction.origin_location_code.ilike(resolved_location_code)
+        )
+
+    if resolved_asset_code:
+        base_query = base_query.filter(
+            OperationTransaction.primary_asset_code.ilike(resolved_asset_code)
+        )
+
+    if resolved_status:
+        base_query = base_query.filter(OperationTransaction.status == resolved_status)
+
+    if resolved_search:
+        s = f"%{resolved_search.lower()}%"
+        base_query = base_query.filter(
+            or_(
+                func.lower(func.coalesce(OperationTransaction.operation_ticket_number, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.operation_number, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.operation_type_code, "")).ilike(s),
+                func.lower(func.coalesce(OT.operation_type_name, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.origin_location_code, "")).ilike(s),
+                func.lower(func.coalesce(LOC.location_name, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.primary_asset_code, "")).ilike(s),
+                func.lower(func.coalesce(AST.asset_name, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.status, "")).ilike(s),
+            )
+        )
+
+    # Total rows count
+    total_rows = base_query.count()
+
+    # Status counts (same filters, but ignore status filter so tabs can show totals)
+    count_query = (
+        db.query(OperationTransaction.status, func.count(OperationTransaction.id))
+        .outerjoin(OT, OT.operation_type_code == OperationTransaction.operation_type_code)
+        .outerjoin(LOC, LOC.location_code == OperationTransaction.origin_location_code)
+        .outerjoin(AST, AST.asset_code == OperationTransaction.primary_asset_code)
+    )
+
+    if date_from:
+        count_query = count_query.filter(OperationTransaction.operation_date >= date_from)
+    if date_to:
+        count_query = count_query.filter(OperationTransaction.operation_date <= date_to)
+    if resolved_operation_type_code:
+        count_query = count_query.filter(OperationTransaction.operation_type_code.ilike(resolved_operation_type_code))
+    if resolved_location_code:
+        count_query = count_query.filter(OperationTransaction.origin_location_code.ilike(resolved_location_code))
+    if resolved_asset_code:
+        count_query = count_query.filter(OperationTransaction.primary_asset_code.ilike(resolved_asset_code))
+    if resolved_search:
+        s = f"%{resolved_search.lower()}%"
+        count_query = count_query.filter(
+            or_(
+                func.lower(func.coalesce(OperationTransaction.operation_ticket_number, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.operation_number, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.operation_type_code, "")).ilike(s),
+                func.lower(func.coalesce(OT.operation_type_name, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.origin_location_code, "")).ilike(s),
+                func.lower(func.coalesce(LOC.location_name, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.primary_asset_code, "")).ilike(s),
+                func.lower(func.coalesce(AST.asset_name, "")).ilike(s),
+                func.lower(func.coalesce(OperationTransaction.status, "")).ilike(s),
+            )
+        )
+
+    status_counts_raw = (
+        count_query.group_by(OperationTransaction.status)
+        .all()
+    )
+
+    status_counts = [
+        {"status": (row[0] or ""), "count": int(row[1] or 0)}
+        for row in status_counts_raw
+        if (row[0] or "").strip() != ""
+    ]
+
+    # Paging
+    offset = (page - 1) * page_size
+
+    rows_raw = (
+        base_query.order_by(OperationTransaction.id.desc())
+        .offset(offset)
+        .limit(page_size + 1)
+        .all()
+    )
+
+    has_more = len(rows_raw) > page_size
+    rows_raw = rows_raw[:page_size]
+
+    rows = []
+    for r in rows_raw:
+        ticket_number = r.operation_ticket_number or r.operation_number or ""
+        rows.append(
+            {
+                "id": r.id,
+                "ticket_number": ticket_number,
+                "operation_number": r.operation_number,
+                "convoy_number": r.convoy_number,
+                "operation_date": r.operation_date,
+                "operation_type_id": r.operation_type_id,
+                "operation_type_code": r.operation_type_code,
+                "operation_type_name": r.operation_type_name or "",
+                "location_id": r.location_id,
+                "location_code": r.origin_location_code,
+                "location_name": r.location_name or "",
+                "primary_asset_id": r.asset_id,
+                "primary_asset_code": r.primary_asset_code,
+                "primary_asset_name": r.asset_name or "",
+                "status": r.status or "",
+                "field_count": int(r.field_count or 0),
+                "created_at": r.created_at,
+            }
+        )
+
+    return {
+        "rows": rows,
+        "total_rows": total_rows,
+        "page": page,
+        "page_size": page_size,
+        "has_more": has_more,
+        "status_counts": status_counts,
+    }
+
 @app.get("/operation-transactions/export/csv")
 def export_operation_transactions_csv(
     date_from: str | None = None,
@@ -9566,6 +10823,7 @@ VALID_ENTRY_LAYOUT_TYPES = [
     "Vessel Cycle",
     "Tanker Loading",
     "Meter Reading",
+    "Shuttle Tracking",
 ]
 
 VALID_CALCULATION_ENGINES = [
@@ -10335,8 +11593,22 @@ def create_operation_entry(
         transaction_operation_type_code,
     ) = validate_operation_entry(entry, db)
 
-    trip = get_trip_by_convoy_or_none(db, entry.transaction.convoy_number)
-    ensure_trip_not_closed(trip)
+    # ✅ Trip lock ONLY for barges (avoid blocking shuttle/tanker convoy numbers)
+    trip = None
+    if str(operation_type.applicable_asset_type_code or "").strip().upper() == "BARGE":
+        trip = get_trip_by_convoy_or_none(db, entry.transaction.convoy_number)
+        ensure_trip_not_closed(trip)
+
+    # ✅ Shuttle lock ONLY for Shuttle Tracking templates
+    if str(template.entry_layout_type or "").strip() == "Shuttle Tracking":
+        voyage = get_or_create_shuttle_voyage(
+            db=db,
+            location_code=entry.transaction.origin_location_code,
+            shuttle_number=entry.transaction.convoy_number or "",
+            shuttle_asset_code=asset.asset_code,
+            current_user=current_user,
+        )
+        ensure_shuttle_voyage_not_closed(voyage)
 
     ticket_number = generate_operation_ticket_number(
         db=db,
@@ -12253,6 +13525,516 @@ def close_tanker_tracking_movement(
         db,
     )
 
+
+@app.post("/shuttle-voyages/close", response_model=ShuttleVoyageResponse)
+def close_shuttle_voyage(
+    request: ShuttleVoyageCloseRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Shuttle Tracking", db)
+
+    voyage = get_or_create_shuttle_voyage(
+        db=db,
+        location_code=request.location_code,
+        shuttle_number=request.shuttle_number,
+        shuttle_asset_code=request.shuttle_asset_code,
+        current_user=current_user,
+    )
+
+    ensure_shuttle_voyage_not_closed(voyage)
+
+    voyage.status = "CLOSED"
+    voyage.closed_by = get_current_user_label(current_user)
+    voyage.closed_at = datetime.utcnow()
+    voyage.closure_remarks = clean_optional_text(request.closure_remarks)
+    voyage.updated_at = datetime.utcnow()
+
+    create_audit_log(
+        db=db,
+        module_name="Shuttle Tracking",
+        action="Close Shuttle Voyage",
+        current_user=current_user,
+        entity_type="ShuttleVoyage",
+        entity_id=voyage.id,
+        entity_label=f"{voyage.location_code}-{voyage.shuttle_asset_code}-{voyage.shuttle_number}",
+        remarks="Shuttle voyage closed",
+        request_path="/shuttle-voyages/close",
+        details={
+            "location_code": voyage.location_code,
+            "shuttle_number": voyage.shuttle_number,
+            "shuttle_asset_code": voyage.shuttle_asset_code,
+        },
+    )
+
+    db.commit()
+    db.refresh(voyage)
+    return voyage
+
+
+@app.post("/shuttle-voyages/reopen", response_model=ShuttleVoyageResponse)
+def reopen_shuttle_voyage(
+    request: ShuttleVoyageReopenRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Shuttle Tracking", db)
+
+    voyage = get_shuttle_voyage_by_key(
+        db,
+        request.location_code,
+        request.shuttle_number,
+        request.shuttle_asset_code,
+    )
+
+    if not voyage:
+        raise HTTPException(status_code=404, detail="Shuttle voyage not found")
+
+    voyage.status = "OPEN"
+    voyage.closed_by = None
+    voyage.closed_at = None
+    voyage.closure_remarks = None
+    voyage.updated_at = datetime.utcnow()
+
+    if request.remarks:
+        voyage.remarks = clean_optional_text(request.remarks)
+
+    create_audit_log(
+        db=db,
+        module_name="Shuttle Tracking",
+        action="Reopen Shuttle Voyage",
+        current_user=current_user,
+        entity_type="ShuttleVoyage",
+        entity_id=voyage.id,
+        entity_label=f"{voyage.location_code}-{voyage.shuttle_asset_code}-{voyage.shuttle_number}",
+        remarks="Shuttle voyage reopened",
+        request_path="/shuttle-voyages/reopen",
+        details={
+            "location_code": voyage.location_code,
+            "shuttle_number": voyage.shuttle_number,
+            "shuttle_asset_code": voyage.shuttle_asset_code,
+        },
+    )
+
+    db.commit()
+    db.refresh(voyage)
+    return voyage
+
+
+@app.get("/shuttle-tracking", response_model=ShuttleTrackingResponse)
+def get_shuttle_tracking(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    location_code: str | None = None,
+    shuttle_number: str | None = None,
+    shuttle_asset_code: str | None = None,
+    # ✅ NEW enterprise params
+    tab: str | None = None,          # OPEN / CLOSED
+    search: str | None = None,       # keyword search
+    page: int = 1,
+    page_size: int = 20,
+    include_tickets: bool = False,   # list-only by default
+    group_key: str | None = None,    # lazy-load one voyage
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Shuttle Tracking", db)
+
+    df = parse_date_filter(date_from, "date_from")
+    dt = parse_date_filter(date_to, "date_to")
+
+    lc = clean_optional_text(location_code)
+    sn = clean_optional_text(shuttle_number)
+    ac = clean_optional_text(shuttle_asset_code)
+
+    tab_norm = (clean_optional_text(tab) or "OPEN").upper()
+    search_norm = (clean_optional_text(search) or "").strip()
+
+    page = 1 if page is None or page < 1 else page
+    page_size = 20 if page_size is None or page_size < 1 else min(int(page_size), 200)
+    offset = (page - 1) * page_size
+
+    # -----------------------------
+    # Base query (Approved + has shuttle_payload)
+    # -----------------------------
+    base_q = (
+        db.query(OperationTransaction)
+        .join(
+            OperationTransactionValue,
+            OperationTransactionValue.transaction_id == OperationTransaction.id,
+        )
+        .filter(
+            OperationTransactionValue.field_code == "shuttle_payload",
+            OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+        )
+    )
+
+    if df:
+        base_q = base_q.filter(OperationTransaction.operation_date >= df)
+    if dt:
+        base_q = base_q.filter(OperationTransaction.operation_date <= dt)
+    if lc:
+        base_q = base_q.filter(OperationTransaction.origin_location_code.ilike(lc))
+    if sn:
+        base_q = base_q.filter(OperationTransaction.convoy_number.ilike(sn))
+    if ac:
+        base_q = base_q.filter(OperationTransaction.primary_asset_code.ilike(ac))
+
+    # Optional keyword search (basic)
+    if search_norm:
+        like = f"%{search_norm}%"
+        base_q = base_q.filter(
+            or_(
+                OperationTransaction.origin_location_code.ilike(like),
+                OperationTransaction.convoy_number.ilike(like),
+                OperationTransaction.primary_asset_code.ilike(like),
+                OperationTransaction.operation_number.ilike(like),
+                OperationTransaction.operation_ticket_number.ilike(like),
+                OperationTransaction.product_name.ilike(like),
+            )
+        )
+
+    # -----------------------------
+    # If lazy-loading a single voyage, parse group_key => filter base_q
+    # group_key format: location|shuttle_number|asset_code
+    # -----------------------------
+    if group_key:
+        parts = [p.strip() for p in str(group_key).split("|")]
+        if len(parts) == 3:
+            g_loc, g_shuttle, g_asset = parts
+            base_q = base_q.filter(
+                OperationTransaction.origin_location_code == g_loc,
+                OperationTransaction.convoy_number == g_shuttle,
+                OperationTransaction.primary_asset_code == g_asset,
+            )
+            include_tickets = True
+        else:
+            raise HTTPException(status_code=400, detail="Invalid group_key format")
+
+    # -----------------------------
+    # Get distinct voyage keys with paging
+    # Join ShuttleVoyage for OPEN/CLOSED filtering (enterprise)
+    # -----------------------------
+    voyage_status_expr = func.coalesce(ShuttleVoyage.status, literal("OPEN"))
+
+    key_loc = OperationTransaction.origin_location_code
+    key_shuttle = OperationTransaction.convoy_number
+    key_asset = OperationTransaction.primary_asset_code
+
+    group_q = (
+        base_q.with_entities(
+            key_loc.label("location_code"),
+            key_shuttle.label("shuttle_number"),
+            key_asset.label("shuttle_asset_code"),
+            func.min(OperationTransaction.operation_date).label("first_date"),
+            func.max(OperationTransaction.operation_date).label("last_date"),
+        )
+        .outerjoin(
+            ShuttleVoyage,
+            and_(
+                ShuttleVoyage.location_code == key_loc,
+                ShuttleVoyage.shuttle_number == key_shuttle,
+                ShuttleVoyage.shuttle_asset_code == key_asset,
+            ),
+        )
+        .group_by(key_loc, key_shuttle, key_asset, voyage_status_expr)
+    )
+
+    if tab_norm == "CLOSED":
+        group_q = group_q.filter(voyage_status_expr == "CLOSED")
+    else:
+        group_q = group_q.filter(voyage_status_expr != "CLOSED")
+
+    total_groups = group_q.count()
+
+    group_rows = (
+        group_q.order_by(func.max(OperationTransaction.operation_date).desc(), key_loc.asc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
+
+    # No voyages on this page
+    if not group_rows:
+        return {
+            "rows": [],
+            "total_groups": total_groups,
+            "page": page,
+            "page_size": page_size,
+            "has_more": total_groups > offset + page_size,
+        }
+
+    # Build keys list for fetching tickets only for paged voyages
+    keys = [
+        (r.location_code, r.shuttle_number, r.shuttle_asset_code)
+        for r in group_rows
+    ]
+
+    # If list-only mode, return voyages without tickets (fast)
+    if not include_tickets:
+        # ✅ Compute totals for voyages on this page WITHOUT returning ticket list
+        # Pull only shuttle_payload values for these keys and sum net fields.
+        key_filters = []
+        for (loc_code, sh_num, asset_code) in keys:
+            key_filters.append(
+                and_(
+                    OperationTransaction.origin_location_code == loc_code,
+                    OperationTransaction.convoy_number == sh_num,
+                    OperationTransaction.primary_asset_code == asset_code,
+                )
+            )
+
+        payload_rows = (
+            db.query(
+                OperationTransaction.origin_location_code,
+                OperationTransaction.convoy_number,
+                OperationTransaction.primary_asset_code,
+                OperationTransactionValue.field_value,
+            )
+            .join(
+                OperationTransactionValue,
+                OperationTransactionValue.transaction_id == OperationTransaction.id,
+            )
+            .filter(
+                OperationTransactionValue.field_code == "shuttle_payload",
+                OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            )
+            .filter(or_(*key_filters))
+            .all()
+        )
+
+        totals_map = {}  # key -> {tov, fw, nsv}
+        for (loc_code, sh_num, asset_code, field_value) in payload_rows:
+            k = f"{loc_code}|{sh_num}|{asset_code}"
+            if k not in totals_map:
+                totals_map[k] = {"tov": 0.0, "fw": 0.0, "nsv": 0.0}
+
+            if isinstance(field_value, dict):
+                net = ((field_value.get("calculated") or {}).get("net") or {})
+                tov = abs(float(safe_float(net.get("TOV"))))
+                fw = abs(float(safe_float(net.get("FW"))))
+                nsv = abs(float(safe_float(net.get("NSV"))))
+
+                totals_map[k]["tov"] += tov
+                totals_map[k]["fw"] += fw
+                totals_map[k]["nsv"] += nsv
+
+        rows = []
+        for (loc_code, sh_num, asset_code) in keys:
+            asset = get_asset_by_code(asset_code, db)
+            loc = get_location_by_code(loc_code, db)
+            voyage = get_shuttle_voyage_by_key(db, loc_code, sh_num or "", asset_code)
+
+            k = f"{loc_code}|{sh_num}|{asset_code}"
+            t = totals_map.get(k, {"tov": 0.0, "fw": 0.0, "nsv": 0.0})
+
+            rows.append(
+                {
+                    "group_key": k,
+                    "location_code": loc_code,
+                    "location_name": loc.location_name if loc else "",
+                    "shuttle_number": sh_num or "",
+                    "shuttle_asset_code": asset_code,
+                    "shuttle_asset_name": asset.asset_name if asset else "",
+                    "voyage_status": voyage.status if voyage else "OPEN",
+                    "closed_by": voyage.closed_by if voyage else None,
+                    "closed_at": voyage.closed_at if voyage else None,
+                    "closure_remarks": voyage.closure_remarks if voyage else None,
+                    "total_tov_bbl": float(t["tov"]),
+                    "total_free_water_bbl": float(t["fw"]),
+                    "total_nsv_bbl": float(t["nsv"]),
+                    "tickets": [],
+                }
+            )
+
+        return {
+            "rows": rows,
+            "total_groups": total_groups,
+            "page": page,
+            "page_size": page_size,
+            "has_more": total_groups > offset + page_size,
+        }
+
+    # -----------------------------
+    # Include tickets: fetch only transactions for these keys
+    # -----------------------------
+    tx_q = (
+        db.query(OperationTransaction)
+        .join(
+            OperationTransactionValue,
+            OperationTransactionValue.transaction_id == OperationTransaction.id,
+        )
+        .filter(
+            OperationTransactionValue.field_code == "shuttle_payload",
+            OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+        )
+    )
+
+    # Reapply the same filters
+    if df:
+        tx_q = tx_q.filter(OperationTransaction.operation_date >= df)
+    if dt:
+        tx_q = tx_q.filter(OperationTransaction.operation_date <= dt)
+    if search_norm:
+        like = f"%{search_norm}%"
+        tx_q = tx_q.filter(
+            or_(
+                OperationTransaction.origin_location_code.ilike(like),
+                OperationTransaction.convoy_number.ilike(like),
+                OperationTransaction.primary_asset_code.ilike(like),
+                OperationTransaction.operation_number.ilike(like),
+                OperationTransaction.operation_ticket_number.ilike(like),
+                OperationTransaction.product_name.ilike(like),
+            )
+        )
+
+    # Key filter: only paged voyages
+    key_filters = []
+    for (loc_code, sh_num, asset_code) in keys:
+        key_filters.append(
+            and_(
+                OperationTransaction.origin_location_code == loc_code,
+                OperationTransaction.convoy_number == sh_num,
+                OperationTransaction.primary_asset_code == asset_code,
+            )
+        )
+    tx_q = tx_q.filter(or_(*key_filters))
+
+    txs = (
+        tx_q.order_by(OperationTransaction.operation_date.asc(), OperationTransaction.id.asc())
+        .all()
+    )
+
+    grouped = {}
+
+    for tx in txs:
+        payload = get_shuttle_payload_for_transaction(db, tx.id) or {}
+        meta = (payload.get("meta") or {}) if isinstance(payload, dict) else {}
+        net = ((payload.get("calculated") or {}).get("net") or {}) if isinstance(payload, dict) else {}
+        inputs = (payload.get("inputs") or {}) if isinstance(payload, dict) else {}
+
+        tov = float(safe_float(net.get("TOV")))
+        fw = float(safe_float(net.get("FW")))
+        nsv = float(safe_float(net.get("NSV")))
+
+        event_time = inputs.get("event_time")
+        opening_stock = float(safe_float(inputs.get("opening_stock_bbl")))
+        opening_water = float(safe_float(inputs.get("opening_water_bbl")))
+        closing_stock = float(safe_float(inputs.get("closing_stock_bbl")))
+        closing_water = float(safe_float(inputs.get("closing_water_bbl")))
+        net_stock = float(safe_float(net.get("net_stock_bbl")))
+        net_water = float(safe_float(net.get("net_water_bbl")))
+
+        barge_reference = inputs.get("barge_reference")
+        remarks = inputs.get("remarks")
+
+        asset = get_asset_by_code(tx.primary_asset_code, db)
+        loc = get_location_by_code(tx.origin_location_code, db)
+
+        key = f"{tx.origin_location_code}|{tx.convoy_number}|{tx.primary_asset_code}"
+
+        if key not in grouped:
+            voyage = get_shuttle_voyage_by_key(
+                db,
+                tx.origin_location_code,
+                tx.convoy_number or "",
+                tx.primary_asset_code,
+            )
+
+            grouped[key] = {
+                "group_key": key,
+                "location_code": tx.origin_location_code,
+                "location_name": loc.location_name if loc else "",
+                "shuttle_number": tx.convoy_number or "",
+                "shuttle_asset_code": tx.primary_asset_code,
+                "shuttle_asset_name": asset.asset_name if asset else "",
+                "voyage_status": voyage.status if voyage else "OPEN",
+                "closed_by": voyage.closed_by if voyage else None,
+                "closed_at": voyage.closed_at if voyage else None,
+                "closure_remarks": voyage.closure_remarks if voyage else None,
+                "tickets": [],
+                "total_tov_bbl": 0.0,
+                "total_free_water_bbl": 0.0,
+                "total_nsv_bbl": 0.0,
+            }
+
+        grouped[key]["tickets"].append(
+            {
+                "transaction_id": tx.id,
+                "ticket_number": get_transaction_ticket_number(tx),
+                "operation_number": tx.operation_number,
+                "location_code": tx.origin_location_code,
+                "location_name": loc.location_name if loc else "",
+                "shuttle_number": tx.convoy_number or "",
+                "shuttle_asset_code": tx.primary_asset_code,
+                "shuttle_asset_name": asset.asset_name if asset else "",
+                "product_name": tx.product_name,
+                "operation_date": tx.operation_date,
+                "event_time": event_time,
+                "opening_stock_bbl": opening_stock,
+                "opening_water_bbl": opening_water,
+                "closing_stock_bbl": closing_stock,
+                "closing_water_bbl": closing_water,
+                "net_stock_bbl": net_stock,
+                "net_water_bbl": net_water,
+                "barge_reference": barge_reference,
+                "remarks": remarks,
+                "vessel_operation_code": meta.get("vessel_operation_code"),
+                "vessel_operation_label": meta.get("vessel_operation_label"),
+                "vessel_operation_category": meta.get("vessel_operation_category"),
+                "vessel_operation_sign": meta.get("vessel_operation_sign"),
+                "tov_bbl": tov,
+                "free_water_bbl": fw,
+                "nsv_bbl": nsv,
+                "status": tx.status,
+                "created_by": tx.created_by,
+                "created_at": tx.created_at,
+                "updated_at": tx.updated_at,
+            }
+        )
+
+        grouped[key]["total_tov_bbl"] += abs(tov)
+        grouped[key]["total_free_water_bbl"] += abs(fw)
+        grouped[key]["total_nsv_bbl"] += abs(nsv)
+
+    # Return rows in the same order as group_rows (paged ordering)
+    rows = []
+    for (loc_code, sh_num, asset_code) in keys:
+        k = f"{loc_code}|{sh_num}|{asset_code}"
+        if k in grouped:
+            rows.append(grouped[k])
+        else:
+            # In case of no tickets (rare)
+            asset = get_asset_by_code(asset_code, db)
+            loc = get_location_by_code(loc_code, db)
+            voyage = get_shuttle_voyage_by_key(db, loc_code, sh_num or "", asset_code)
+            rows.append(
+                {
+                    "group_key": k,
+                    "location_code": loc_code,
+                    "location_name": loc.location_name if loc else "",
+                    "shuttle_number": sh_num or "",
+                    "shuttle_asset_code": asset_code,
+                    "shuttle_asset_name": asset.asset_name if asset else "",
+                    "voyage_status": voyage.status if voyage else "OPEN",
+                    "closed_by": voyage.closed_by if voyage else None,
+                    "closed_at": voyage.closed_at if voyage else None,
+                    "closure_remarks": voyage.closure_remarks if voyage else None,
+                    "tickets": [],
+                    "total_tov_bbl": 0.0,
+                    "total_free_water_bbl": 0.0,
+                    "total_nsv_bbl": 0.0,
+                }
+            )
+
+    return {
+        "rows": rows,
+        "total_groups": total_groups,
+        "page": page,
+        "page_size": page_size,
+        "has_more": total_groups > offset + page_size,
+    }
+
 # -------------------------
 # Barge / Trip Tracking APIs
 # -------------------------
@@ -13242,6 +15024,84 @@ def ensure_trip_not_closed(trip: Trip | None):
             status_code=400,
             detail="Trip is CLOSED for this convoy. Reopen the trip to continue.",
         )
+
+class ShuttleVoyageStatusUpdateRequest(BaseModel):
+    location_code: str
+    shuttle_number: str
+    shuttle_asset_code: str
+    remarks: str | None = None
+
+
+def get_shuttle_voyage_by_key(db: Session, location_code: str, shuttle_number: str, shuttle_asset_code: str):
+    lc = clean_optional_text(location_code)
+    sn = clean_optional_text(shuttle_number)
+    ac = clean_optional_text(shuttle_asset_code)
+
+    if not lc or not sn or not ac:
+        return None
+
+    return (
+        db.query(ShuttleVoyage)
+        .filter(
+            ShuttleVoyage.location_code.ilike(lc),
+            ShuttleVoyage.shuttle_number.ilike(sn),
+            ShuttleVoyage.shuttle_asset_code.ilike(ac),
+        )
+        .first()
+    )
+
+
+def ensure_shuttle_voyage_not_closed(voyage: ShuttleVoyage | None):
+    if not voyage:
+        return
+    if str(voyage.status or "").strip().upper() == "CLOSED":
+        raise HTTPException(
+            status_code=400,
+            detail="Shuttle voyage is CLOSED for this key. Reopen the voyage to continue.",
+        )
+
+
+def get_or_create_shuttle_voyage(
+    db: Session,
+    location_code: str,
+    shuttle_number: str,
+    shuttle_asset_code: str,
+    current_user: User,
+):
+    voyage = get_shuttle_voyage_by_key(db, location_code, shuttle_number, shuttle_asset_code)
+
+    if voyage:
+        return voyage
+
+    created_by_display = get_current_user_label(current_user)
+
+    voyage = ShuttleVoyage(
+        location_code=str(location_code).strip(),
+        shuttle_number=str(shuttle_number).strip(),
+        shuttle_asset_code=str(shuttle_asset_code).strip(),
+        status="OPEN",
+        created_by=created_by_display,
+        remarks=None,
+    )
+    db.add(voyage)
+    db.flush()
+    return voyage
+
+
+def get_shuttle_payload_for_transaction(db: Session, transaction_id: int):
+    row = (
+        db.query(OperationTransactionValue)
+        .filter(
+            OperationTransactionValue.transaction_id == transaction_id,
+            OperationTransactionValue.field_code == "shuttle_payload",
+        )
+        .first()
+    )
+    if not row:
+        return None
+    if isinstance(row.field_value, dict):
+        return row.field_value
+    return None
 
 def require_barge_tracking_ready_for_closure(
     trip: Trip,
@@ -14304,6 +16164,46 @@ def validate_multi_tank_seals_before_submit(
         "mismatch_count": mismatch_count,
     }
 
+def get_transaction_value_text(db: Session, transaction_id: int, field_code: str):
+    v = (
+        db.query(OperationTransactionValue)
+        .filter(
+            OperationTransactionValue.transaction_id == transaction_id,
+            OperationTransactionValue.field_code == field_code,
+        )
+        .first()
+    )
+    if not v:
+        return None
+    if v.field_value is None:
+        return None
+    return str(v.field_value).strip()
+
+
+def resolve_barge_event_type_from_ticket(db: Session, transaction: OperationTransaction):
+    # First preference: stored stage
+    stage = get_transaction_value_text(db, transaction.id, "barge_event_type")
+    if stage:
+        stage_u = stage.strip().upper()
+        if stage_u in ["LOAD_1", "LOAD_2_TOPUP", "UNLOAD", "STS"]:
+            return stage_u
+
+    # Fallback: old logic (minimal)
+    code_u = str(transaction.operation_type_code or "").upper()
+    if any(k in code_u for k in ["UNLOAD", "DISCHARGE", "RECEIPT", "RECEIVE"]):
+        return "UNLOAD"
+
+    return None
+
+
+def auto_create_trip_event_on_submit(
+    db: Session,
+    transaction: OperationTransaction,
+    current_user: User,
+):
+    return None, None
+
+
 def auto_create_barge_tracking_on_approval(
     db: Session,
     transaction: OperationTransaction,
@@ -14313,10 +16213,11 @@ def auto_create_barge_tracking_on_approval(
     if convoy is None:
         return None, None, None
 
-    if not is_barge_transaction(transaction):
+    if str(transaction.primary_asset_type_code or "").strip().upper() != "BARGE":
         return None, None, None
 
-    require_approved_transaction_for_tracking(transaction, "barge tracking")
+    if transaction.status != "Approved":
+        return None, None, None
 
     asset_code = str(transaction.primary_asset_code or "").strip()
     if not asset_code:
@@ -14338,11 +16239,12 @@ def auto_create_barge_tracking_on_approval(
 
     ensure_trip_not_closed(trip)
 
-    movement_type = resolve_barge_event_type(db, transaction)
-    if movement_type == "UNLOAD":
-        event_type = "UNLOAD"
-    else:
-        previous_load_event = (
+    # Decide event type
+    chosen = resolve_barge_event_type_from_ticket(db, transaction)
+
+    if chosen is None:
+        # fallback: LOAD_1 or LOAD_2_TOPUP based on previous load events
+        prev_load = (
             db.query(TripEvent)
             .filter(
                 TripEvent.trip_id == trip.id,
@@ -14352,73 +16254,48 @@ def auto_create_barge_tracking_on_approval(
             .order_by(TripEvent.sequence_no.desc(), TripEvent.id.desc())
             .first()
         )
-        event_type = "LOAD_1" if not previous_load_event else "LOAD_2_TOPUP"
+        chosen = "LOAD_1" if not prev_load else "LOAD_2_TOPUP"
 
-    # ✅ If event already exists for this ticket, UPDATE it (do NOT return early)
-    existing_event_for_ticket = (
+    existing = (
         db.query(TripEvent)
         .filter(TripEvent.operation_transaction_id == transaction.id)
         .first()
     )
 
-    if existing_event_for_ticket:
-        existing_event_for_ticket.event_type = event_type
-        existing_event_for_ticket.location_code = clean_optional_text(transaction.origin_location_code)
-        existing_event_for_ticket.asset_code = asset_code
-        existing_event_for_ticket.event_datetime = transaction.operation_start_datetime or existing_event_for_ticket.event_datetime
-        existing_event_for_ticket.updated_at = datetime.now()
-        new_event = existing_event_for_ticket
-        db.flush()
+    if existing:
+        existing.event_type = chosen
+        existing.location_code = clean_optional_text(transaction.origin_location_code) or existing.location_code
+        existing.asset_code = asset_code
+        existing.event_datetime = transaction.operation_start_datetime or existing.event_datetime
+        existing.updated_at = datetime.now()
+        new_event = existing
     else:
         max_seq = (
             db.query(func.max(TripEvent.sequence_no))
             .filter(TripEvent.trip_id == trip.id)
             .scalar()
         )
-        sequence_no = (max_seq or 0) + 1
+        seq = (max_seq or 0) + 1
 
         new_event = TripEvent(
             trip_id=trip.id,
-            event_type=event_type,
+            event_type=chosen,
             location_code=clean_optional_text(transaction.origin_location_code),
             asset_code=asset_code,
             operation_transaction_id=transaction.id,
-            sequence_no=sequence_no,
+            sequence_no=seq,
             event_datetime=transaction.operation_start_datetime or datetime.now(),
             created_by=created_by_display,
             remarks="Auto-created on Approval",
         )
-
         db.add(new_event)
         db.flush()
 
-        create_audit_log(
-            db=db,
-            module_name="Barge Tracking",
-            action="Auto Create Barge Event",
-            current_user=current_user,
-            entity_type="TripEvent",
-            entity_id=new_event.id,
-            entity_label=f"{convoy} | {event_type} | {asset_code}",
-            ticket_number=get_transaction_ticket_number(transaction),
-            operation_number=transaction.operation_number,
-            remarks="Auto-created on Approval",
-            request_path="/operation-transactions/{id}/status",
-            details={
-                "convoy_number": convoy,
-                "trip_id": trip.id,
-                "event_type": event_type,
-                "asset_code": asset_code,
-                "operation_transaction_id": transaction.id,
-                "sequence_no": new_event.sequence_no,
-            },
-        )
+    new_cmp = None
 
-    # ✅ Comparison creation must happen even if the event existed earlier
-    new_comparison = None
-
-    if event_type == "UNLOAD":
-        latest_load_event = (
+    # Only UNLOAD creates the main comparison
+    if chosen == "UNLOAD":
+        latest_load = (
             db.query(TripEvent)
             .filter(
                 TripEvent.trip_id == trip.id,
@@ -14430,74 +16307,52 @@ def auto_create_barge_tracking_on_approval(
             .first()
         )
 
-        if latest_load_event and latest_load_event.operation_transaction_id:
-            existing_comparison = (
-                db.query(TripComparison)
-                .filter(
-                    TripComparison.trip_id == trip.id,
-                    TripComparison.comparison_type == "LOAD_AFTER_vs_UNLOAD_BEFORE",
-                    TripComparison.left_transaction_id == latest_load_event.operation_transaction_id,
-                    TripComparison.right_transaction_id == transaction.id,
-                )
+        if latest_load and latest_load.operation_transaction_id:
+            left_tx = (
+                db.query(OperationTransaction)
+                .filter(OperationTransaction.id == latest_load.operation_transaction_id)
                 .first()
             )
 
-            if not existing_comparison:
-                left_tx = (
-                    db.query(OperationTransaction)
-                    .filter(OperationTransaction.id == latest_load_event.operation_transaction_id)
+            if left_tx and left_tx.status == "Approved":
+                existing_cmp = (
+                    db.query(TripComparison)
+                    .filter(
+                        TripComparison.trip_id == trip.id,
+                        TripComparison.comparison_type == "LOAD_AFTER_vs_UNLOAD_BEFORE",
+                        TripComparison.left_transaction_id == left_tx.id,
+                        TripComparison.right_transaction_id == transaction.id,
+                    )
                     .first()
                 )
 
-                require_approved_transaction_for_tracking(left_tx, "barge comparison")
+                if not existing_cmp:
+                    left_payload = load_multi_tank_payload(db, left_tx.id)
+                    right_payload = load_multi_tank_payload(db, transaction.id)
 
-                left_payload = load_multi_tank_payload(db, left_tx.id) if left_tx else None
-                right_payload = load_multi_tank_payload(db, transaction.id)
+                    if left_payload and right_payload:
+                        summary_json, per_tank_json = build_multitank_comparison_json(
+                            left_tx=left_tx,
+                            right_tx=transaction,
+                            comparison_type="LOAD_AFTER_vs_UNLOAD_BEFORE",
+                            left_payload=left_payload,
+                            right_payload=right_payload,
+                        )
 
-                if left_payload and right_payload:
-                    summary_json, per_tank_json = build_multitank_comparison_json(
-                        left_tx=left_tx,
-                        right_tx=transaction,
-                        comparison_type="LOAD_AFTER_vs_UNLOAD_BEFORE",
-                        left_payload=left_payload,
-                        right_payload=right_payload,
-                    )
+                        new_cmp = TripComparison(
+                            trip_id=trip.id,
+                            comparison_type="LOAD_AFTER_vs_UNLOAD_BEFORE",
+                            left_transaction_id=left_tx.id,
+                            right_transaction_id=transaction.id,
+                            summary_json=summary_json,
+                            per_tank_json=per_tank_json,
+                            created_by=created_by_display,
+                            remarks="Auto-created on UNLOAD Approval",
+                        )
+                        db.add(new_cmp)
+                        db.flush()
 
-                    new_comparison = TripComparison(
-                        trip_id=trip.id,
-                        comparison_type="LOAD_AFTER_vs_UNLOAD_BEFORE",
-                        left_transaction_id=left_tx.id,
-                        right_transaction_id=transaction.id,
-                        summary_json=summary_json,
-                        per_tank_json=per_tank_json,
-                        created_by=created_by_display,
-                        remarks="Auto-created on Approval",
-                    )
-                    db.add(new_comparison)
-                    db.flush()
-
-                    create_audit_log(
-                        db=db,
-                        module_name="Barge Tracking",
-                        action="Auto Create Trip Comparison",
-                        current_user=current_user,
-                        entity_type="TripComparison",
-                        entity_id=new_comparison.id,
-                        entity_label=f"{convoy} | {asset_code} | LOAD_AFTER_vs_UNLOAD_BEFORE",
-                        ticket_number=get_transaction_ticket_number(transaction),
-                        operation_number=transaction.operation_number,
-                        remarks="Auto-created on Approval",
-                        request_path="/operation-transactions/{id}/status",
-                        details={
-                            "convoy_number": convoy,
-                            "trip_id": trip.id,
-                            "comparison_type": "LOAD_AFTER_vs_UNLOAD_BEFORE",
-                            "left_transaction_id": left_tx.id,
-                            "right_transaction_id": transaction.id,
-                        },
-                    )
-
-    return trip, new_event, new_comparison
+    return trip, new_event, new_cmp
 
 @app.patch("/operation-transactions/{transaction_id}/status")
 def update_operation_transaction_status(
@@ -14517,9 +16372,11 @@ def update_operation_transaction_status(
             status_code=404,
             detail="Operation transaction not found",
         )
-    
-    trip = get_trip_by_convoy_or_none(db, transaction.convoy_number)
-    ensure_trip_not_closed(trip)
+
+    trip = None
+    if str(transaction.primary_asset_type_code or "").strip().upper() == "BARGE":
+        trip = get_trip_by_convoy_or_none(db, transaction.convoy_number)
+        ensure_trip_not_closed(trip)
 
     next_status = clean_optional_text(status_update.status)
 
@@ -14553,6 +16410,14 @@ def update_operation_transaction_status(
     
     status_remarks = clean_optional_text(status_update.remarks)
 
+    review_confirmed = bool(getattr(status_update, "review_confirmed", False))
+
+    if next_status in ["Submitted", "Approved"] and not review_confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail="Review confirmation is required for Submit/Approve.",
+        )
+
     seal_validation_details = None
     if next_status == "Submitted":
         seal_validation_details = validate_multi_tank_seals_before_submit(
@@ -14561,14 +16426,34 @@ def update_operation_transaction_status(
             submit_remarks=status_remarks,
         )
 
+    if next_status in ["Submitted", "Approved"] and review_confirmed:
+        status_remarks = (status_remarks or "").strip()
+        status_remarks = (status_remarks + "\n[REVIEW CONFIRMED]").strip()
+
     transaction.status = next_status
     transaction.updated_at = datetime.now()
 
-    # Movement tracking must start only after approval.
-    # Draft / Submitted tickets must not pass forward to receiver tracking.
     # Movement tracking must start only after Approval.
     # Draft / Submitted tickets must not move into Barge Tracking.
     if next_status == "Approved":
+        template = None
+        if transaction.operation_template_id:
+            template = (
+                db.query(OperationTemplate)
+                .filter(OperationTemplate.id == transaction.operation_template_id)
+                .first()
+            )
+
+        if template and str(template.entry_layout_type or "").strip() == "Shuttle Tracking":
+            voyage = get_or_create_shuttle_voyage(
+                db=db,
+                location_code=transaction.origin_location_code,
+                shuttle_number=transaction.convoy_number or "",
+                shuttle_asset_code=transaction.primary_asset_code,
+                current_user=current_user,
+            )
+            ensure_shuttle_voyage_not_closed(voyage)
+
         auto_create_barge_tracking_on_approval(
             db=db,
             transaction=transaction,
@@ -14576,6 +16461,12 @@ def update_operation_transaction_status(
         )
 
         create_tank_stock_ledger_from_approved_transaction(
+            db=db,
+            transaction=transaction,
+            current_user=current_user,
+        )
+
+        create_or_update_vessel_stock_ledger_from_approved_transaction(
             db=db,
             transaction=transaction,
             current_user=current_user,
@@ -14634,6 +16525,9 @@ def update_operation_transaction_status(
             "origin_location_code": transaction.origin_location_code,
             "operation_date": str(transaction.operation_date),
             "seal_validation": seal_validation_details,
+            "review_confirmed": review_confirmed,
+            "reviewed_by": changed_by if review_confirmed else None,
+            "reviewed_at": datetime.now().isoformat() if review_confirmed else None,
         },
     )
 
