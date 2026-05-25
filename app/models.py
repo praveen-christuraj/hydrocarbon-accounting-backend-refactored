@@ -902,26 +902,107 @@ class CompanyReportProfile(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now())
 
+
+class DashboardConfig(Base):
+    __tablename__ = "dashboard_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    name = Column(String(150), nullable=False, index=True)
+    scope_type = Column(String(20), nullable=False, index=True)
+    location_code = Column(String(50), nullable=True, index=True)
+
+    status = Column(String(20), nullable=False, default="Draft", index=True)
+
+    active_version_id = Column(
+        Integer,
+        ForeignKey("dashboard_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    created_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "scope_type",
+            "location_code",
+            name="unique_dashboard_config_scope",
+        ),
+    )
+
+
+class DashboardVersion(Base):
+    __tablename__ = "dashboard_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    config_id = Column(
+        Integer,
+        ForeignKey("dashboard_configs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    version_number = Column(Integer, nullable=False)
+    config_json = Column(JSONB, nullable=False)
+
+    change_note = Column(Text, nullable=True)
+    created_by = Column(String(150), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "config_id",
+            "version_number",
+            name="unique_dashboard_version_per_config",
+        ),
+    )
+
+
+class DashboardDataSource(Base):
+    __tablename__ = "dashboard_data_sources"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    data_source_code = Column(String(120), nullable=False, index=True)
+    data_source_name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+
+    handler_key = Column(String(120), nullable=False, index=True)
+    allowed_params_json = Column(JSONB, nullable=False)
+
+    status = Column(String(20), nullable=False, default="Active")
+    created_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "data_source_code",
+            name="unique_dashboard_data_source_code",
+        ),
+    )
+
+
 class BargeSealMaster(Base):
     __tablename__ = "barge_seal_master"
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # Barge asset code (YADE-01)
     asset_code = Column(String(80), nullable=False, index=True)
-
-    # Tank id or special group code:
-    # examples: C1, C2, P1... or PORT_MANIFOLD, STBD_MANIFOLD, PUMPROOM
     tank_id = Column(String(50), nullable=False, index=True)
-
-    # Seal position:
-    # tank examples: MH1, MH2, LOCK, DIPHATCH
-    # manifold/pumproom examples: S1, S2, S3...
     seal_position = Column(String(50), nullable=False, index=True)
-
     seal_number = Column(String(100), nullable=False)
 
-    # Optional effective date (same master can be revised by date later if needed)
     effective_date = Column(Date, nullable=True)
 
     remarks = Column(Text, nullable=True)
@@ -1170,5 +1251,40 @@ class ShuttleVoyage(Base):
             "shuttle_number",
             "shuttle_asset_code",
             name="unique_shuttle_voyage_key",
+        ),
+    )
+
+class FSOVoyage(Base):
+    __tablename__ = "fso_voyages"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Location of the FSO operation (FSO location)
+    location_code = Column(String(50), nullable=False, index=True)
+
+    # Shuttle number is the base tracking reference (stored in convoy_number on tickets)
+    shuttle_number = Column(String(80), nullable=False, index=True)
+
+    # Primary asset on FSO tickets (the FSO asset code)
+    fso_asset_code = Column(String(80), nullable=False, index=True)
+
+    status = Column(String(20), nullable=False, default="OPEN")  # OPEN / CLOSED
+
+    created_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    closed_by = Column(String(150), nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    closure_remarks = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "location_code",
+            "shuttle_number",
+            "fso_asset_code",
+            name="unique_fso_voyage_key",
         ),
     )

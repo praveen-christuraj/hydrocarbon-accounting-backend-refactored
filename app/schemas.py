@@ -651,6 +651,9 @@ class ShuttleTrackingGroupResponse(BaseModel):
     total_free_water_bbl: float = 0
     total_nsv_bbl: float = 0
 
+    net_receipt_bbl: float = 0
+    net_discharge_bbl: float = 0
+
     tickets: list[ShuttleTrackingTicketResponse] = []
 
 
@@ -659,6 +662,118 @@ class ShuttleTrackingResponse(BaseModel):
     total_groups: int = 0
 
     # ✅ NEW: pagination metadata
+    page: int = 1
+    page_size: int = 20
+    has_more: bool = False
+
+class FSOVoyageCloseRequest(BaseModel):
+    location_code: str
+    shuttle_number: str
+    fso_asset_code: str
+    closure_remarks: Optional[str] = None
+
+
+class FSOVoyageReopenRequest(BaseModel):
+    location_code: str
+    shuttle_number: str
+    fso_asset_code: str
+    remarks: Optional[str] = None
+
+
+class FSOVoyageResponse(BaseModel):
+    id: int
+    location_code: str
+    shuttle_number: str
+    fso_asset_code: str
+    status: str
+
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closure_remarks: Optional[str] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class FSOTrackingTicketResponse(BaseModel):
+    transaction_id: int
+    ticket_number: Optional[str] = None
+    operation_number: Optional[str] = None
+
+    location_code: str
+    location_name: str
+
+    shuttle_number: str
+    fso_asset_code: str
+    fso_asset_name: str
+
+    product_name: Optional[str] = None
+    operation_date: Optional[date] = None
+    event_time: Optional[str] = None
+
+    operation_label: Optional[str] = None  # Receipt / Export / Stock Opening (soft-coded)
+    vessel_name: Optional[str] = None
+    vessel_quantity_bbl: float = 0
+
+    opening_stock_bbl: float = 0
+    opening_water_bbl: float = 0
+    closing_stock_bbl: float = 0
+    closing_water_bbl: float = 0
+
+    net_stock_bbl: float = 0
+    net_water_bbl: float = 0
+    variance_bbl: float = 0
+
+    remarks: Optional[str] = None
+
+    status: str = ""
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class FSOTrackingGroupResponse(BaseModel):
+    group_key: str
+
+    location_code: str
+    location_name: str
+
+    shuttle_number: str
+    fso_asset_code: str
+    fso_asset_name: str
+
+    voyage_status: str = "OPEN"
+    closed_by: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closure_remarks: Optional[str] = None
+
+    # OTR-style summary (like old fso_operations.py)
+    total_receipts_bbl: float = 0
+    total_exports_bbl: float = 0
+    total_water_in_bbl: float = 0
+    total_water_out_bbl: float = 0
+    net_water_bbl: float = 0
+    loss_gain_bbl: float = 0
+    total_variance_bbl: float = 0
+
+    # ✅ Compare fields
+
+    shuttle_discharge_bbl: float = 0
+    fso_receipt_bbl: float = 0
+    variance_bbl: float = 0
+
+    tickets: list[FSOTrackingTicketResponse] = []
+
+
+class FSOTrackingResponse(BaseModel):
+    rows: list[FSOTrackingGroupResponse] = []
+    total_groups: int = 0
+
     page: int = 1
     page_size: int = 20
     has_more: bool = False
@@ -843,6 +958,96 @@ class OutTurnReportResponse(BaseModel):
 
     status: str
     remarks: Optional[str] = None
+
+# -------------------------
+# FSO Report Schemas (FINAL)
+# -------------------------
+
+class FSOOTRRowResponse(BaseModel):
+    transaction_id: int
+    ticket_number: str
+    operation_number: Optional[str] = None
+
+    accounting_date: date
+    operation_date: date
+    event_time: Optional[str] = None
+
+    location_code: str
+    location_name: Optional[str] = None
+
+    fso_asset_code: str
+    fso_asset_name: Optional[str] = None
+
+    operation_label: str
+    operation_sign: str  # IN / OUT / SET / NEUTRAL
+
+    shuttle_number: Optional[str] = None
+
+    vessel_name: Optional[str] = None
+    vessel_quantity_bbl: float = 0
+
+    opening_stock_bbl: float = 0
+    opening_water_bbl: float = 0
+    closing_stock_bbl: float = 0
+    closing_water_bbl: float = 0
+
+    net_stock_bbl: float = 0
+    net_water_bbl: float = 0
+
+    movement_qty_bbl: float = 0
+    variance_bbl: float = 0
+
+    source_shuttle_discharge_bbl: float = 0
+    compare_variance_bbl: float = 0
+
+    remarks: Optional[str] = None
+
+
+class FSOOTRReportResponse(BaseModel):
+    rows: list[FSOOTRRowResponse] = []
+
+    total_receipt_bbl: float = 0
+    total_export_bbl: float = 0
+    total_movement_bbl: float = 0
+    total_variance_bbl: float = 0
+    total_compare_variance_bbl: float = 0
+
+
+class FSOMaterialBalanceRowResponse(BaseModel):
+    accounting_date: date
+
+    opening_stock_bbl: float = 0
+    receipt_bbl: float = 0
+    export_bbl: float = 0
+
+    book_closing_bbl: float = 0
+    physical_closing_bbl: float = 0
+    physical_closing_water_bbl: float = 0
+
+    loss_gain_bbl: float = 0
+
+
+class FSOMaterialBalanceReportResponse(BaseModel):
+    rows: list[FSOMaterialBalanceRowResponse] = []
+
+
+class FSOOutturnRowResponse(BaseModel):
+    accounting_date: date
+    shuttle_number: str
+
+    shuttle_discharge_bbl: float = 0
+    fso_receipt_bbl: float = 0
+    variance_bbl: float = 0
+    variance_pct: float = 0
+
+
+class FSOOutturnReportResponse(BaseModel):
+    rows: list[FSOOutturnRowResponse] = []
+
+    total_shuttle_discharge_bbl: float = 0
+    total_fso_receipt_bbl: float = 0
+    total_variance_bbl: float = 0
+    total_variance_pct: float = 0
 
 # -------------------------
 # Material Balance Template Configuration Schemas
@@ -1683,6 +1888,105 @@ class CompanyReportProfileResponse(CompanyReportProfileBase):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DashboardConfigCreate(BaseModel):
+    name: str
+    scope_type: str
+    location_code: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class DashboardConfigUpdate(BaseModel):
+    name: Optional[str] = None
+    scope_type: Optional[str] = None
+    location_code: Optional[str] = None
+    status: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class DashboardConfigResponse(BaseModel):
+    id: int
+    name: str
+    scope_type: str
+    location_code: Optional[str] = None
+    status: str
+    active_version_id: Optional[int] = None
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DashboardVersionResponse(BaseModel):
+    id: int
+    config_id: int
+    version_number: int
+    config_json: Any
+    change_note: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DashboardPublishRequest(BaseModel):
+    config_json: dict
+    change_note: Optional[str] = None
+
+
+class DashboardRevertRequest(BaseModel):
+    version_id: int
+    change_note: Optional[str] = None
+
+
+class DashboardDataSourceCreate(BaseModel):
+    data_source_code: str
+    data_source_name: str
+    description: Optional[str] = None
+    handler_key: str
+    allowed_params_json: dict
+    status: str = "Active"
+    remarks: Optional[str] = None
+
+
+class DashboardDataSourceUpdate(BaseModel):
+    data_source_code: Optional[str] = None
+    data_source_name: Optional[str] = None
+    description: Optional[str] = None
+    handler_key: Optional[str] = None
+    allowed_params_json: Optional[dict] = None
+    status: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class DashboardDataSourceResponse(BaseModel):
+    id: int
+    data_source_code: str
+    data_source_name: str
+    description: Optional[str] = None
+    handler_key: str
+    allowed_params_json: Any
+    status: str
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DashboardDataRequest(BaseModel):
+    data_source_code: str
+    params: dict
+
+
+class DashboardDataResponse(BaseModel):
+    data_source_code: str
+    rows: list[dict]
+    meta: dict
 
 # -------------------------
 # Barge Seal Master Schemas
