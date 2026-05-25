@@ -10,9 +10,10 @@ from openpyxl.utils import get_column_letter
 
 from fastapi.middleware.cors import CORSMiddleware
 
-CORS_ORIGINS = [
+allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://hydrocarbon-accounting-frontend.vercel.app",
 ]
 
 app = FastAPI(
@@ -22,7 +23,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
