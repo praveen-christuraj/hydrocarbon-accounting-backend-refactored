@@ -325,6 +325,23 @@ def require_user_permission(
     permission_name: str,
     db: Session,
 ):
+    # --- Admin bypass (bootstrap) ---
+    admin_role_names = {"admin"}  # compare lowercase
+    user_role_names = {
+        str(r.role_name or "").lower()
+        for r in (
+            db.query(Role)
+            .join(UserRole, UserRole.role_id == Role.id)
+            .filter(UserRole.user_id == user.id)
+            .all()
+        )
+        if str(r.role_name or "").strip() != ""
+    }
+
+    if user_role_names.intersection(admin_role_names):
+        return user
+    # --- end Admin bypass ---
+
     if not user_has_permission(user, permission_name, db):
         raise HTTPException(
             status_code=403,
