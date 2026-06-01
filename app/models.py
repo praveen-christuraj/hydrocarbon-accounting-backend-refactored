@@ -1020,6 +1020,92 @@ class BargeSealMaster(Base):
         ),
     )
 
+class FlowmeterConfig(Base):
+    __tablename__ = "flowmeter_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    location_code = Column(String(50), nullable=False, index=True)
+    asset_code = Column(String(80), nullable=False, index=True)
+    stream_name = Column(String(150), nullable=False, default="Default", index=True)
+    meter_asset_code = Column(String(80), nullable=True, index=True)
+
+    meter_label = Column(String(150), nullable=False)
+    meter_factor = Column(Float, nullable=False, default=1.0)
+    meter_unit = Column(String(10), nullable=False, default="bbls")  # bbls or m3
+    calibration_date = Column(Date, nullable=True)
+
+    remarks = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="Active")
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "location_code",
+            "asset_code",
+            "stream_name",
+            "meter_asset_code",
+            "meter_label",
+            name="unique_flowmeter_config_key",
+        ),
+    )
+
+
+class FlowmeterRecord(Base):
+    __tablename__ = "flowmeter_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    location_code = Column(String(50), nullable=False, index=True)
+    asset_code = Column(String(80), nullable=False, index=True)
+    meter_label = Column(String(150), nullable=False, index=True)
+
+    reading_date = Column(Date, nullable=False, index=True)
+    opening_reading = Column(Float, nullable=False, default=0)
+    closing_reading = Column(Float, nullable=False, default=0)
+    gross_observed = Column(Float, nullable=False, default=0)
+
+    meter_factor = Column(Float, nullable=False, default=1.0)
+    meter_unit = Column(String(10), nullable=False, default="bbls")
+    net_standard = Column(Float, nullable=False, default=0)
+    net_standard_bbl = Column(Float, nullable=False, default=0)
+
+    created_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="Active")
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+class FlowmeterConfigHistory(Base):
+    __tablename__ = "flowmeter_config_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_id = Column(Integer, ForeignKey("flowmeter_configs.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    location_code = Column(String(50), nullable=False, index=True)
+    asset_code = Column(String(80), nullable=False, index=True)
+    stream_name = Column(String(150), nullable=False, default="Default", index=True)
+    meter_asset_code = Column(String(80), nullable=True, index=True)
+    meter_label = Column(String(150), nullable=False, index=True)
+
+    old_meter_factor = Column(Float, nullable=True)
+    new_meter_factor = Column(Float, nullable=True)
+    old_meter_unit = Column(String(10), nullable=True)
+    new_meter_unit = Column(String(10), nullable=True)
+    old_calibration_date = Column(Date, nullable=True)
+    new_calibration_date = Column(Date, nullable=True)
+    old_status = Column(String(20), nullable=True)
+    new_status = Column(String(20), nullable=True)
+
+    change_action = Column(String(20), nullable=False, default="UPDATE")
+    changed_by = Column(String(150), nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    changed_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+
 class VesselOperation(Base):
     __tablename__ = "vessel_operations"
 

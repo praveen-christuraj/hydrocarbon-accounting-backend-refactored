@@ -2018,3 +2018,97 @@ class BargeSealMasterResponse(BargeSealMasterRowBase):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------
+# Flowmeter Config Schemas
+# -------------------------
+
+class FlowmeterConfigBase(BaseModel):
+    location_code: Optional[str] = None
+    asset_code: str
+    stream_name: str = "Default"
+    meter_asset_code: Optional[str] = None
+    meter_label: str
+    meter_factor: float = 1.0
+    meter_unit: str = "bbls"  # bbls or m3
+    calibration_date: Optional[date] = None
+    remarks: Optional[str] = None
+    status: str = "Active"
+
+
+class FlowmeterConfigCreate(FlowmeterConfigBase):
+    pass
+
+
+class FlowmeterConfigResponse(FlowmeterConfigBase):
+    id: int
+    location_name: Optional[str] = None
+    asset_name: Optional[str] = None
+    meter_asset_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------
+# Flowmeter Record Schemas
+# -------------------------
+
+class FlowmeterRecordBase(BaseModel):
+    location_code: str
+    asset_code: str
+    stream_name: Optional[str] = None
+    meter_label: str
+    reading_date: date
+    opening_reading: float
+    closing_reading: float
+    meter_factor: float = 1.0
+    meter_unit: str = "bbls"
+    remarks: Optional[str] = None
+    status: str = "Active"
+
+
+class FlowmeterRecordCreate(FlowmeterRecordBase):
+    pass
+
+
+class FlowmeterRecordResponse(FlowmeterRecordBase):
+    id: int
+    location_name: Optional[str] = None
+    asset_name: Optional[str] = None
+
+    gross_observed: float = 0
+    net_standard: float = 0
+    net_standard_bbl: float = 0
+
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class FlowmeterConfigHistoryResponse(BaseModel):
+    id: int
+    config_id: int
+    location_code: str
+    asset_code: str
+    stream_name: str
+    meter_asset_code: Optional[str] = None
+    meter_label: str
+    old_meter_factor: Optional[float] = None
+    new_meter_factor: Optional[float] = None
+    old_meter_unit: Optional[str] = None
+    new_meter_unit: Optional[str] = None
+    old_calibration_date: Optional[date] = None
+    new_calibration_date: Optional[date] = None
+    old_status: Optional[str] = None
+    new_status: Optional[str] = None
+    change_action: str
+    changed_by: Optional[str] = None
+    remarks: Optional[str] = None
+    changed_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

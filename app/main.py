@@ -73,6 +73,9 @@ from app.models import (
     UserRole,
     Table11Factor,
     BargeSealMaster,
+    FlowmeterConfig,
+    FlowmeterRecord,
+    FlowmeterConfigHistory,
     CompanyReportProfile,
     DashboardConfig,
     DashboardVersion,
@@ -164,6 +167,11 @@ from app.schemas import (
     Table11LookupResponse,
     BargeSealMasterBulkSaveRequest,
     BargeSealMasterResponse,
+    FlowmeterConfigCreate,
+    FlowmeterConfigResponse,
+    FlowmeterRecordCreate,
+    FlowmeterRecordResponse,
+    FlowmeterConfigHistoryResponse,
     CompanyReportProfileCreate,
     CompanyReportProfileResponse,
     DashboardConfigCreate,
@@ -743,6 +751,104 @@ def ensure_vessel_operation_show_in_column():
             )
         )
 
+def ensure_flowmeter_stream_columns():
+    inspector = inspect(engine)
+
+    table_names = inspector.get_table_names()
+
+    if "flowmeter_configs" in table_names:
+        cols = {c["name"] for c in inspector.get_columns("flowmeter_configs")}
+        with engine.begin() as conn:
+            if "stream_name" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_configs "
+                        "ADD COLUMN stream_name VARCHAR(150) DEFAULT 'Default';"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE flowmeter_configs SET stream_name = 'Default' "
+                        "WHERE stream_name IS NULL OR TRIM(stream_name) = '';"
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_flowmeter_configs_stream_name "
+                    "ON flowmeter_configs(stream_name);"
+                )
+            )
+            if "meter_asset_code" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_configs "
+                        "ADD COLUMN meter_asset_code VARCHAR(80);"
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_flowmeter_configs_meter_asset_code "
+                    "ON flowmeter_configs(meter_asset_code);"
+                )
+            )
+            if "calibration_date" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_configs "
+                        "ADD COLUMN calibration_date DATE;"
+                    )
+                )
+
+    if "flowmeter_config_history" in table_names:
+        cols = {c["name"] for c in inspector.get_columns("flowmeter_config_history")}
+        with engine.begin() as conn:
+            if "stream_name" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_config_history "
+                        "ADD COLUMN stream_name VARCHAR(150) DEFAULT 'Default';"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE flowmeter_config_history SET stream_name = 'Default' "
+                        "WHERE stream_name IS NULL OR TRIM(stream_name) = '';"
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_flowmeter_config_history_stream_name "
+                    "ON flowmeter_config_history(stream_name);"
+                )
+            )
+            if "meter_asset_code" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_config_history "
+                        "ADD COLUMN meter_asset_code VARCHAR(80);"
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_flowmeter_config_history_meter_asset_code "
+                    "ON flowmeter_config_history(meter_asset_code);"
+                )
+            )
+            if "old_calibration_date" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_config_history "
+                        "ADD COLUMN old_calibration_date DATE;"
+                    )
+                )
+            if "new_calibration_date" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE flowmeter_config_history "
+                        "ADD COLUMN new_calibration_date DATE;"
+                    )
+                )
+
 def ensure_barge_event_type_template_field():
     """
     Ensures Operation Templates used for BARGE Multi-Tank Before/After have
@@ -813,6 +919,7 @@ ensure_operation_template_layout_columns()
 ensure_tank_stock_ledger_accounting_columns()
 ensure_tank_stock_ledger_stock_snapshot_columns()
 ensure_vessel_operation_show_in_column()
+ensure_flowmeter_stream_columns()
 ensure_barge_event_type_template_field()
 
 
@@ -892,6 +999,22 @@ def login_user(
             "user_id": user.id,
             "username": user.username,
         }
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Authentication",
+        action="Login Success",
+        current_user=user,
+        entity_type="User",
+        entity_id=user.id,
+        entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
+        remarks="User login successful",
+        request_path="/auth/login",
+        details={
+            "username": user.username,
+            "user_status": user.status,
+        },
     )
 
     return {
@@ -2008,6 +2131,27 @@ def seed_standard_permissions(
             "permission_name": "Manage Barge Seal Master",
             "module_name": "Barge Seal Master",
             "description": "Can create/update barge seal master",
+        },
+        # Flowmeter Configuration / Records
+        {
+            "permission_name": "View Flowmeter Config",
+            "module_name": "Flowmeter Config",
+            "description": "Can view flowmeter meter configuration by location and asset",
+        },
+        {
+            "permission_name": "Manage Flowmeter Config",
+            "module_name": "Flowmeter Config",
+            "description": "Can create, update, and delete flowmeter meter configuration",
+        },
+        {
+            "permission_name": "View Flowmeter Record",
+            "module_name": "Flowmeter Record",
+            "description": "Can view flowmeter meter records",
+        },
+        {
+            "permission_name": "Create Flowmeter Record",
+            "module_name": "Flowmeter Record",
+            "description": "Can create flowmeter meter records",
         },
         # Company / Report Profiles
         {
@@ -3693,6 +3837,15 @@ def delete_asset(
         raise HTTPException(
             status_code=400,
             detail="Cannot delete asset because assignment history exists for this asset",
+        )
+
+    flowmeter_config = db.query(FlowmeterConfig).filter(
+        FlowmeterConfig.asset_code.ilike(existing_asset.asset_code)
+    ).first()
+    if flowmeter_config:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete stream asset because flowmeters are configured under this stream",
         )
 
     deleted_data = {
@@ -6495,6 +6648,28 @@ def create_vessel_operation(
     )
 
     db.add(row)
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Create Vessel Operation",
+        current_user=current_user,
+        entity_type="VesselOperation",
+        entity_id=None,
+        entity_label=f"{row.operation_label} ({row.operation_code})",
+        remarks="Vessel operation created",
+        request_path="/vessel-operations",
+        details={
+            "location_code": row.location_code,
+            "applicable_asset_type_code": row.applicable_asset_type_code,
+            "operation_code": row.operation_code,
+            "operation_label": row.operation_label,
+            "operation_category": row.operation_category,
+            "operation_sign": row.operation_sign,
+            "show_in": row.show_in,
+            "sort_order": row.sort_order,
+            "status": row.status,
+        },
+    )
     db.commit()
     db.refresh(row)
     return build_vessel_operation_response(row, db)
@@ -6513,6 +6688,17 @@ def update_vessel_operation(
         raise HTTPException(status_code=404, detail="Vessel operation not found")
 
     d = validate_vessel_operation(vessel_operation, db, vessel_operation_id)
+    before_data = {
+        "location_code": existing.location_code,
+        "applicable_asset_type_code": existing.applicable_asset_type_code,
+        "operation_code": existing.operation_code,
+        "operation_label": existing.operation_label,
+        "operation_category": existing.operation_category,
+        "operation_sign": existing.operation_sign,
+        "show_in": existing.show_in,
+        "sort_order": existing.sort_order,
+        "status": existing.status,
+    }
 
     existing.location_code = d["location_code"]
     existing.applicable_asset_type_code = d["asset_type_code"]
@@ -6525,6 +6711,31 @@ def update_vessel_operation(
     existing.description = clean_optional_text(vessel_operation.description)
     existing.status = vessel_operation.status or "Active"
     existing.updated_at = datetime.now()
+
+    after_data = {
+        "location_code": existing.location_code,
+        "applicable_asset_type_code": existing.applicable_asset_type_code,
+        "operation_code": existing.operation_code,
+        "operation_label": existing.operation_label,
+        "operation_category": existing.operation_category,
+        "operation_sign": existing.operation_sign,
+        "show_in": existing.show_in,
+        "sort_order": existing.sort_order,
+        "status": existing.status,
+    }
+
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Update Vessel Operation",
+        current_user=current_user,
+        entity_type="VesselOperation",
+        entity_id=existing.id,
+        entity_label=f"{existing.operation_label} ({existing.operation_code})",
+        remarks="Vessel operation updated",
+        request_path=f"/vessel-operations/{vessel_operation_id}",
+        details={"before": before_data, "after": after_data},
+    )
 
     db.commit()
     db.refresh(existing)
@@ -6541,6 +6752,31 @@ def delete_vessel_operation(
     existing = db.query(VesselOperation).filter(VesselOperation.id == vessel_operation_id).first()
     if not existing:
         raise HTTPException(status_code=404, detail="Vessel operation not found")
+
+    deleted_data = {
+        "location_code": existing.location_code,
+        "applicable_asset_type_code": existing.applicable_asset_type_code,
+        "operation_code": existing.operation_code,
+        "operation_label": existing.operation_label,
+        "operation_category": existing.operation_category,
+        "operation_sign": existing.operation_sign,
+        "show_in": existing.show_in,
+        "sort_order": existing.sort_order,
+        "status": existing.status,
+    }
+
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Delete Vessel Operation",
+        current_user=current_user,
+        entity_type="VesselOperation",
+        entity_id=existing.id,
+        entity_label=f"{existing.operation_label} ({existing.operation_code})",
+        remarks="Vessel operation deleted",
+        request_path=f"/vessel-operations/{vessel_operation_id}",
+        details={"deleted": deleted_data},
+    )
 
     db.delete(existing)
     db.commit()
@@ -6963,6 +7199,24 @@ def create_movement_mapping(
     )
 
     db.add(m)
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Create Movement Mapping",
+        current_user=current_user,
+        entity_type="MovementMapping",
+        entity_id=None,
+        entity_label=f"{m.mapping_type} | {m.location_code} | {m.reference_number}",
+        remarks="Movement mapping created",
+        request_path="/movement-mappings",
+        details={
+            "mapping_type": m.mapping_type,
+            "location_code": m.location_code,
+            "reference_number": m.reference_number,
+            "product_name": m.product_name,
+            "status": m.status,
+        },
+    )
     db.commit()
     db.refresh(m)
 
@@ -6989,6 +7243,8 @@ def add_mapping_items(
     if role not in ["SOURCE", "TARGET"]:
         raise HTTPException(status_code=400, detail="role must be SOURCE or TARGET")
 
+    added_transaction_ids = []
+    skipped_transaction_ids = []
     for tid in request.transaction_ids:
         tx = db.query(OperationTransaction).filter(OperationTransaction.id == tid).first()
         if not tx:
@@ -7002,6 +7258,7 @@ def add_mapping_items(
             MovementMappingItem.transaction_id == tid,
         ).first()
         if exists:
+            skipped_transaction_ids.append(tid)
             continue
 
         qty, water, nsv = extract_transaction_quantities(db, tx)
@@ -7024,11 +7281,29 @@ def add_mapping_items(
             nsv_bbl=nsv,
         )
         db.add(item)
+        added_transaction_ids.append(tid)
 
     db.flush()
     recompute_mapping_comparison(db, mapping_id)
 
     mapping.updated_at = datetime.now()
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Add Movement Mapping Items",
+        current_user=current_user,
+        entity_type="MovementMapping",
+        entity_id=mapping.id,
+        entity_label=f"{mapping.mapping_type} | {mapping.location_code} | {mapping.reference_number}",
+        remarks="Movement mapping items added",
+        request_path=f"/movement-mappings/{mapping_id}/items",
+        details={
+            "role": role,
+            "requested_transaction_ids": request.transaction_ids,
+            "added_transaction_ids": added_transaction_ids,
+            "skipped_existing_transaction_ids": skipped_transaction_ids,
+        },
+    )
     db.commit()
     db.refresh(mapping)
 
@@ -7064,6 +7339,23 @@ def remove_mapping_item(
     recompute_mapping_comparison(db, mapping_id)
 
     mapping.updated_at = datetime.now()
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Remove Movement Mapping Item",
+        current_user=current_user,
+        entity_type="MovementMapping",
+        entity_id=mapping.id,
+        entity_label=f"{mapping.mapping_type} | {mapping.location_code} | {mapping.reference_number}",
+        remarks="Movement mapping item removed",
+        request_path=f"/movement-mappings/{mapping_id}/items/{item_id}",
+        details={
+            "removed_item_id": item_id,
+            "removed_transaction_id": item.transaction_id,
+            "removed_role": item.role,
+            "removed_ticket_number": item.ticket_number,
+        },
+    )
     db.commit()
     db.refresh(mapping)
 
@@ -7093,6 +7385,27 @@ def close_mapping(
     )
     mapping.closed_at = datetime.now()
     mapping.updated_at = datetime.now()
+
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Close Movement Mapping",
+        current_user=current_user,
+        entity_type="MovementMapping",
+        entity_id=mapping.id,
+        entity_label=f"{mapping.mapping_type} | {mapping.location_code} | {mapping.reference_number}",
+        old_status="OPEN",
+        new_status="CLOSED",
+        remarks="Movement mapping closed",
+        request_path=f"/movement-mappings/{mapping_id}/close",
+        details={
+            "mapping_type": mapping.mapping_type,
+            "location_code": mapping.location_code,
+            "reference_number": mapping.reference_number,
+            "closed_by": mapping.closed_by,
+            "closed_at": mapping.closed_at.isoformat() if mapping.closed_at else None,
+        },
+    )
 
     db.commit()
     db.refresh(mapping)
@@ -20523,7 +20836,18 @@ def seed_dashboard_data_sources(db: Session, current_user_label: str | None):
             "data_source_name": "Tank Stock Snapshot",
             "description": "Tank stock snapshot (placeholder)",
             "handler_key": "TANK_STOCK_SNAPSHOT",
-            "allowed_params_json": {"allowed": []},
+            "allowed_params_json": {
+                "allowed": [
+                    {"key": "location_code", "type": "str", "required": True},
+                    {"key": "asset_type_code", "type": "str", "required": False},
+                    {"key": "asset_type_codes", "type": "str", "required": False},
+                    {"key": "value_field", "type": "str", "required": False},
+                    {"key": "capacity_source", "type": "str", "required": False},
+                    {"key": "as_of_date", "type": "date", "required": False},
+                    {"key": "limit", "type": "int", "required": False},
+                    {"key": "sort_by", "type": "str", "required": False},
+                ]
+            },
             "status": "Active",
         },
     ]
@@ -21192,6 +21516,220 @@ def dashboard_data_gateway(
             "data_source_code": code,
             "rows": rows,
             "meta": {"total_rows": len(rows)},
+        }
+
+    if handler_key == "TANK_STOCK_SNAPSHOT":
+        # Required
+        location_code = resolved.get("location_code")
+        if not location_code:
+            raise HTTPException(status_code=400, detail="location_code is required")
+
+        # Optional filters
+        asset_type_code = clean_optional_text(resolved.get("asset_type_code"))
+        asset_type_codes_raw = clean_optional_text(resolved.get("asset_type_codes"))
+        as_of_date = resolved.get("as_of_date")
+
+        # value_field: NSV_BBL / GSV_BBL / LT / MT
+        value_field = str(resolved.get("value_field") or "NSV_BBL").strip().upper()
+
+        # capacity_source: CALIBRATION_MAX / ASSET_FIELD (ASSET_FIELD reserved for later)
+        capacity_source = str(resolved.get("capacity_source") or "CALIBRATION_MAX").strip().upper()
+
+        sort_by = str(resolved.get("sort_by") or "NAME").strip().upper()
+        limit = resolved.get("limit") or 200
+        if limit < 1:
+            limit = 1
+        if limit > 2000:
+            limit = 2000
+
+        # Build asset type filter list (comma-separated is supported)
+        type_list = []
+        if asset_type_codes_raw:
+            type_list = [t.strip().upper() for t in asset_type_codes_raw.split(",") if t.strip()]
+        if asset_type_code:
+            type_list = [asset_type_code.strip().upper()]
+
+        # 1) Resolve tanks dynamically (NO hardcoded asset codes)
+        aq = db.query(Asset).filter(
+            Asset.location_code == location_code,
+            Asset.status == "Active",
+        )
+        if type_list:
+            aq = aq.filter(Asset.asset_type_code.in_(type_list))
+
+        assets = aq.order_by(Asset.asset_code.asc()).all()
+
+        if not assets:
+            return {
+                "data_source_code": code,
+                "rows": [],
+                "meta": {
+                    "total_rows": 0,
+                    "limit": limit,
+                    "note": "No matching active assets for this location/filter",
+                },
+            }
+
+        asset_code_list = [a.asset_code for a in assets]
+
+        # 2) Find latest stock snapshot per tank from TankStockLedger
+        lq = db.query(TankStockLedger).filter(
+            TankStockLedger.location_code == location_code,
+            TankStockLedger.tank_asset_code.in_(asset_code_list),
+        )
+
+        # If as_of_date given, snapshot must be <= that date
+        if as_of_date:
+            lq = lq.filter(TankStockLedger.operation_date <= as_of_date)
+
+        # Latest row per tank (by max(id)) - fast and stable
+        latest_sub = (
+            lq.with_entities(
+                TankStockLedger.tank_asset_code.label("tank_asset_code"),
+                func.max(TankStockLedger.id).label("max_id"),
+            )
+            .group_by(TankStockLedger.tank_asset_code)
+            .subquery()
+        )
+
+        latest_rows = (
+            db.query(TankStockLedger)
+            .join(latest_sub, TankStockLedger.id == latest_sub.c.max_id)
+            .all()
+        )
+
+        ledger_by_code = {r.tank_asset_code: r for r in latest_rows}
+
+        def _safe_num(v):
+            try:
+                if v is None:
+                    return 0.0
+                return float(v)
+            except Exception:
+                return 0.0
+
+        def _get_stock_value(ledger_row: TankStockLedger):
+            if not ledger_row:
+                return 0.0
+            if value_field == "GSV_BBL":
+                return _safe_num(getattr(ledger_row, "stock_gsv_bbl", 0))
+            if value_field == "LT":
+                return _safe_num(getattr(ledger_row, "stock_lt", 0))
+            if value_field == "MT":
+                return _safe_num(getattr(ledger_row, "stock_mt", 0))
+            # default NSV_BBL
+            return _safe_num(getattr(ledger_row, "stock_nsv_bbl", 0))
+
+        # 3) Capacity resolution (soft-coded)
+        # CALIBRATION_MAX: use the active calibration table's OUTPUT column maximum
+        def _capacity_from_calibration(asset_code: str):
+            # choose latest Active calibration table for this asset
+            tables = (
+                db.query(AssetCalibrationTable)
+                .filter(
+                    AssetCalibrationTable.asset_code == asset_code,
+                    AssetCalibrationTable.status == "Active",
+                )
+                .order_by(AssetCalibrationTable.id.desc())
+                .all()
+            )
+            if not tables:
+                return 0.0, None
+
+            for t in tables:
+                # Identify OUTPUT column from the linked template (soft-coded)
+                out_cols = (
+                    db.query(CalibrationTemplateColumn)
+                    .filter(
+                        CalibrationTemplateColumn.template_id == t.template_id,
+                        CalibrationTemplateColumn.interpolation_role == "Output",
+                    )
+                    .order_by(
+                        CalibrationTemplateColumn.sort_order.asc(),
+                        CalibrationTemplateColumn.id.asc(),
+                    )
+                    .all()
+                )
+                if not out_cols:
+                    continue
+
+                output_key = str(out_cols[0].column_name or "").strip()
+                if not output_key:
+                    continue
+
+                # Load calibration data rows and compute max in Python (safe + template-driven)
+                rows = (
+                    db.query(AssetCalibrationData)
+                    .filter(AssetCalibrationData.calibration_table_id == t.id)
+                    .order_by(AssetCalibrationData.row_number.asc())
+                    .all()
+                )
+                max_val = 0.0
+                for r in rows:
+                    data = r.row_data if isinstance(r.row_data, dict) else {}
+                    val = data.get(output_key)
+                    max_val = max(max_val, _safe_num(val))
+
+                if max_val > 0:
+                    return max_val, output_key
+
+            return 0.0, None
+
+        rows = []
+        for a in assets:
+            ledger = ledger_by_code.get(a.asset_code)
+            stock_val = _get_stock_value(ledger)
+
+            capacity_val = 0.0
+            capacity_key = None
+
+            if capacity_source == "CALIBRATION_MAX":
+                capacity_val, capacity_key = _capacity_from_calibration(a.asset_code)
+            # ASSET_FIELD reserved (soft-coded later when we add a capacity field in Asset Master)
+
+            fill_percent = 0.0
+            empty_val = 0.0
+            if capacity_val and capacity_val > 0:
+                fill_percent = (stock_val / capacity_val) * 100.0
+                empty_val = max(capacity_val - stock_val, 0.0)
+
+            rows.append(
+                {
+                    "tank_asset_code": a.asset_code,
+                    "tank_asset_name": a.asset_name,
+                    "asset_type_code": a.asset_type_code,
+                    "location_code": a.location_code,
+                    "as_of_date": str(as_of_date) if as_of_date else None,
+                    "value_field": value_field,
+                    "stock_value": float(stock_val),
+                    "capacity_source": capacity_source,
+                    "capacity_value": float(capacity_val),
+                    "capacity_output_column": capacity_key,
+                    "fill_percent": float(fill_percent),
+                    "empty_value": float(empty_val),
+                }
+            )
+
+        # Sorting
+        if sort_by == "FILL_PERCENT":
+            rows.sort(key=lambda x: x.get("fill_percent", 0.0), reverse=True)
+        elif sort_by == "STOCK_VALUE":
+            rows.sort(key=lambda x: x.get("stock_value", 0.0), reverse=True)
+        else:
+            rows.sort(key=lambda x: (x.get("tank_asset_name") or "", x.get("tank_asset_code") or ""))
+
+        rows = rows[:limit]
+
+        return {
+            "data_source_code": code,
+            "rows": rows,
+            "meta": {
+                "total_rows": len(rows),
+                "limit": limit,
+                "capacity_source": capacity_source,
+                "value_field": value_field,
+                "sort_by": sort_by,
+            },
         }
 
     return {
@@ -21877,3 +22415,722 @@ def bulk_save_barge_seal_master(
         BargeSealMaster.tank_id.asc(),
         BargeSealMaster.seal_position.asc(),
     ).all()
+
+
+# -------------------------
+# Flowmeter Config APIs
+# -------------------------
+
+M3_TO_BBLS_FACTOR = 6.289811
+
+
+def build_flowmeter_config_response(config: FlowmeterConfig, db: Session):
+    location_name = None
+    asset_name = None
+
+    location = (
+        db.query(Location)
+        .filter(Location.location_code.ilike(config.location_code))
+        .first()
+    )
+    if location:
+        location_name = location.location_name
+
+    asset = (
+        db.query(Asset)
+        .filter(Asset.asset_code.ilike(config.asset_code))
+        .first()
+    )
+    if asset:
+        asset_name = asset.asset_name
+    meter_asset_name = None
+    if str(config.meter_asset_code or "").strip():
+        m_asset = (
+            db.query(Asset)
+            .filter(Asset.asset_code.ilike(config.meter_asset_code))
+            .first()
+        )
+        if m_asset:
+            meter_asset_name = m_asset.asset_name
+
+    return {
+        "id": config.id,
+        "location_code": config.location_code,
+        "location_name": location_name,
+        "asset_code": config.asset_code,
+        "asset_name": asset_name,
+        "stream_name": config.stream_name or "Default",
+        "meter_asset_code": config.meter_asset_code,
+        "meter_asset_name": meter_asset_name,
+        "meter_label": config.meter_label,
+        "meter_factor": float(config.meter_factor or 0),
+        "meter_unit": config.meter_unit,
+        "calibration_date": config.calibration_date,
+        "remarks": config.remarks,
+        "status": config.status,
+        "created_at": config.created_at,
+        "updated_at": config.updated_at,
+    }
+
+
+def build_flowmeter_record_response(record: FlowmeterRecord, db: Session):
+    location_name = None
+    asset_name = None
+
+    location = (
+        db.query(Location)
+        .filter(Location.location_code.ilike(record.location_code))
+        .first()
+    )
+    if location:
+        location_name = location.location_name
+
+    asset = (
+        db.query(Asset)
+        .filter(Asset.asset_code.ilike(record.asset_code))
+        .first()
+    )
+    if asset:
+        asset_name = asset.asset_name
+
+    return {
+        "id": record.id,
+        "location_code": record.location_code,
+        "location_name": location_name,
+        "asset_code": record.asset_code,
+        "asset_name": asset_name,
+        "meter_label": record.meter_label,
+        "reading_date": record.reading_date,
+        "opening_reading": float(record.opening_reading or 0),
+        "closing_reading": float(record.closing_reading or 0),
+        "gross_observed": float(record.gross_observed or 0),
+        "meter_factor": float(record.meter_factor or 0),
+        "meter_unit": record.meter_unit,
+        "net_standard": float(record.net_standard or 0),
+        "net_standard_bbl": float(record.net_standard_bbl or 0),
+        "remarks": record.remarks,
+        "status": record.status,
+        "created_by": record.created_by,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
+def build_flowmeter_config_history_response(row: FlowmeterConfigHistory):
+    return {
+        "id": row.id,
+        "config_id": row.config_id,
+        "location_code": row.location_code,
+        "asset_code": row.asset_code,
+        "stream_name": row.stream_name or "Default",
+        "meter_asset_code": row.meter_asset_code,
+        "meter_label": row.meter_label,
+        "old_meter_factor": row.old_meter_factor,
+        "new_meter_factor": row.new_meter_factor,
+        "old_meter_unit": row.old_meter_unit,
+        "new_meter_unit": row.new_meter_unit,
+        "old_calibration_date": row.old_calibration_date,
+        "new_calibration_date": row.new_calibration_date,
+        "old_status": row.old_status,
+        "new_status": row.new_status,
+        "change_action": row.change_action,
+        "changed_by": row.changed_by,
+        "remarks": row.remarks,
+        "changed_at": row.changed_at,
+    }
+
+
+def validate_flowmeter_asset(asset_code: str, db: Session):
+    asset_code_clean = str(asset_code or "").strip()
+
+    if asset_code_clean == "":
+        raise HTTPException(status_code=400, detail="asset_code is required")
+
+    asset = (
+        db.query(Asset)
+        .filter(Asset.asset_code.ilike(asset_code_clean))
+        .first()
+    )
+    if not asset:
+        raise HTTPException(status_code=400, detail="Asset not found")
+
+    assignment = (
+        db.query(AssetAssignment)
+        .filter(
+            AssetAssignment.asset_code.ilike(asset_code_clean),
+            AssetAssignment.status == "Active",
+        )
+        .order_by(
+            AssetAssignment.assignment_date.desc(),
+            AssetAssignment.id.desc(),
+        )
+        .first()
+    )
+
+    if not assignment or not str(assignment.assignment_location_code or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Active asset assignment with location is required for flowmeter configuration",
+        )
+
+    location = (
+        db.query(Location)
+        .filter(Location.location_code.ilike(assignment.assignment_location_code))
+        .first()
+    )
+    if not location:
+        raise HTTPException(status_code=400, detail="Assigned location not found")
+
+    return location, asset
+
+
+@app.get("/flowmeter-configs", response_model=list[FlowmeterConfigResponse])
+def get_flowmeter_configs(
+    location_code: str | None = None,
+    asset_code: str | None = None,
+    stream_name: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Flowmeter Config", db)
+
+    q = db.query(FlowmeterConfig)
+
+    if location_code:
+        q = q.filter(FlowmeterConfig.location_code.ilike(location_code.strip()))
+    if asset_code:
+        q = q.filter(FlowmeterConfig.asset_code.ilike(asset_code.strip()))
+    if stream_name:
+        q = q.filter(FlowmeterConfig.stream_name.ilike(stream_name.strip()))
+
+    rows = q.order_by(
+        FlowmeterConfig.location_code.asc(),
+        FlowmeterConfig.asset_code.asc(),
+        FlowmeterConfig.stream_name.asc(),
+        FlowmeterConfig.meter_label.asc(),
+    ).all()
+
+    return [build_flowmeter_config_response(r, db) for r in rows]
+
+
+@app.post("/flowmeter-configs", response_model=FlowmeterConfigResponse)
+def create_flowmeter_config(
+    request: FlowmeterConfigCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Flowmeter Config", db)
+
+    location, asset = validate_flowmeter_asset(request.asset_code, db)
+
+    meter_label = str(request.meter_label or "").strip()
+    if meter_label == "":
+        raise HTTPException(status_code=400, detail="meter_label is required")
+    stream_name = str(request.stream_name or "").strip() or "Default"
+    meter_asset_code = clean_optional_text(request.meter_asset_code)
+
+    meter_unit = str(request.meter_unit or "bbls").strip().lower()
+    if meter_unit not in {"bbls", "m3"}:
+        raise HTTPException(status_code=400, detail="meter_unit must be bbls or m3")
+
+    meter_factor = float(request.meter_factor or 0)
+    if meter_factor <= 0:
+        raise HTTPException(status_code=400, detail="meter_factor must be greater than 0")
+
+    existing = (
+        db.query(FlowmeterConfig)
+        .filter(
+            FlowmeterConfig.location_code.ilike(location.location_code),
+            FlowmeterConfig.asset_code.ilike(asset.asset_code),
+            FlowmeterConfig.stream_name.ilike(stream_name),
+            FlowmeterConfig.meter_asset_code.ilike(meter_asset_code) if meter_asset_code else FlowmeterConfig.meter_label.ilike(meter_label),
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Flowmeter config already exists")
+
+    row = FlowmeterConfig(
+        location_code=location.location_code,
+        asset_code=asset.asset_code,
+        stream_name=stream_name,
+        meter_asset_code=meter_asset_code,
+        meter_label=meter_label,
+        meter_factor=meter_factor,
+        meter_unit=meter_unit,
+        calibration_date=request.calibration_date,
+        remarks=clean_optional_text(request.remarks),
+        status=request.status or "Active",
+    )
+    db.add(row)
+    db.flush()
+
+    db.add(
+        FlowmeterConfigHistory(
+            config_id=row.id,
+            location_code=row.location_code,
+            asset_code=row.asset_code,
+            stream_name=row.stream_name,
+            meter_asset_code=row.meter_asset_code,
+            meter_label=row.meter_label,
+            old_meter_factor=None,
+            new_meter_factor=row.meter_factor,
+            old_meter_unit=None,
+            new_meter_unit=row.meter_unit,
+            old_calibration_date=None,
+            new_calibration_date=row.calibration_date,
+            old_status=None,
+            new_status=row.status,
+            change_action="CREATE",
+            changed_by=get_current_user_display_name(current_user),
+            remarks="Initial flowmeter config",
+        )
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Flowmeter Config",
+        action="Create Flowmeter Config",
+        current_user=current_user,
+        entity_type="FlowmeterConfig",
+        entity_id=row.id,
+        entity_label=f"{row.asset_code} / {row.meter_label}",
+        remarks="Flowmeter configuration created",
+        request_path="/flowmeter-configs",
+        details={
+            "location_code": row.location_code,
+            "asset_code": row.asset_code,
+            "stream_name": row.stream_name,
+            "meter_asset_code": row.meter_asset_code,
+            "meter_label": row.meter_label,
+            "meter_factor": row.meter_factor,
+            "meter_unit": row.meter_unit,
+            "calibration_date": str(row.calibration_date) if row.calibration_date else None,
+            "status": row.status,
+        },
+    )
+
+    db.commit()
+    db.refresh(row)
+    return build_flowmeter_config_response(row, db)
+
+
+@app.put("/flowmeter-configs/{config_id}", response_model=FlowmeterConfigResponse)
+def update_flowmeter_config(
+    config_id: int,
+    request: FlowmeterConfigCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Flowmeter Config", db)
+
+    row = db.query(FlowmeterConfig).filter(FlowmeterConfig.id == config_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Flowmeter config not found")
+
+    location, asset = validate_flowmeter_asset(request.asset_code, db)
+
+    meter_label = str(request.meter_label or "").strip()
+    if meter_label == "":
+        raise HTTPException(status_code=400, detail="meter_label is required")
+    stream_name = str(request.stream_name or "").strip() or "Default"
+    meter_asset_code = clean_optional_text(request.meter_asset_code)
+
+    meter_unit = str(request.meter_unit or "bbls").strip().lower()
+    if meter_unit not in {"bbls", "m3"}:
+        raise HTTPException(status_code=400, detail="meter_unit must be bbls or m3")
+
+    meter_factor = float(request.meter_factor or 0)
+    if meter_factor <= 0:
+        raise HTTPException(status_code=400, detail="meter_factor must be greater than 0")
+
+    duplicate = (
+        db.query(FlowmeterConfig)
+        .filter(
+            FlowmeterConfig.location_code.ilike(location.location_code),
+            FlowmeterConfig.asset_code.ilike(asset.asset_code),
+            FlowmeterConfig.stream_name.ilike(stream_name),
+            FlowmeterConfig.meter_asset_code.ilike(meter_asset_code) if meter_asset_code else FlowmeterConfig.meter_label.ilike(meter_label),
+            FlowmeterConfig.id != config_id,
+        )
+        .first()
+    )
+    if duplicate:
+        raise HTTPException(status_code=400, detail="Flowmeter config already exists")
+
+    old_factor = float(row.meter_factor or 0)
+    old_unit = row.meter_unit
+    old_calibration_date = row.calibration_date
+    old_status = row.status
+
+    row.location_code = location.location_code
+    row.asset_code = asset.asset_code
+    row.stream_name = stream_name
+    row.meter_asset_code = meter_asset_code
+    row.meter_label = meter_label
+    row.meter_factor = meter_factor
+    row.meter_unit = meter_unit
+    row.calibration_date = request.calibration_date
+    row.remarks = clean_optional_text(request.remarks)
+    row.status = request.status or "Active"
+    row.updated_at = datetime.now()
+
+    db.add(
+        FlowmeterConfigHistory(
+            config_id=row.id,
+            location_code=row.location_code,
+            asset_code=row.asset_code,
+            stream_name=row.stream_name,
+            meter_asset_code=row.meter_asset_code,
+            meter_label=row.meter_label,
+            old_meter_factor=old_factor,
+            new_meter_factor=row.meter_factor,
+            old_meter_unit=old_unit,
+            new_meter_unit=row.meter_unit,
+            old_calibration_date=old_calibration_date,
+            new_calibration_date=row.calibration_date,
+            old_status=old_status,
+            new_status=row.status,
+            change_action="UPDATE",
+            changed_by=get_current_user_display_name(current_user),
+            remarks="Flowmeter config updated",
+        )
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Flowmeter Config",
+        action="Update Flowmeter Config",
+        current_user=current_user,
+        entity_type="FlowmeterConfig",
+        entity_id=row.id,
+        entity_label=f"{row.asset_code} / {row.meter_label}",
+        remarks="Flowmeter configuration updated",
+        request_path=f"/flowmeter-configs/{config_id}",
+        details={
+            "location_code": row.location_code,
+            "asset_code": row.asset_code,
+            "stream_name": row.stream_name,
+            "meter_asset_code": row.meter_asset_code,
+            "meter_label": row.meter_label,
+            "meter_factor": row.meter_factor,
+            "meter_unit": row.meter_unit,
+            "calibration_date": str(row.calibration_date) if row.calibration_date else None,
+            "status": row.status,
+        },
+    )
+
+    db.commit()
+    db.refresh(row)
+    return build_flowmeter_config_response(row, db)
+
+
+@app.delete("/flowmeter-configs/{config_id}")
+def delete_flowmeter_config(
+    config_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Flowmeter Config", db)
+
+    row = db.query(FlowmeterConfig).filter(FlowmeterConfig.id == config_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Flowmeter config not found")
+
+    create_audit_log(
+        db=db,
+        module_name="Flowmeter Config",
+        action="Delete Flowmeter Config",
+        current_user=current_user,
+        entity_type="FlowmeterConfig",
+        entity_id=row.id,
+        entity_label=f"{row.asset_code} / {row.meter_label}",
+        remarks="Flowmeter configuration deleted",
+        request_path=f"/flowmeter-configs/{config_id}",
+        details={
+            "location_code": row.location_code,
+            "asset_code": row.asset_code,
+            "stream_name": row.stream_name,
+            "meter_asset_code": row.meter_asset_code,
+            "meter_label": row.meter_label,
+        },
+    )
+
+    db.delete(row)
+    db.commit()
+    return {"message": "Flowmeter config deleted successfully"}
+
+
+@app.get("/flowmeter-configs/history", response_model=list[FlowmeterConfigHistoryResponse])
+def get_flowmeter_config_history(
+    asset_code: str | None = None,
+    stream_name: str | None = None,
+    meter_label: str | None = None,
+    limit: int = 1000,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Flowmeter Config", db)
+
+    q = db.query(FlowmeterConfigHistory)
+    if asset_code:
+        q = q.filter(FlowmeterConfigHistory.asset_code.ilike(asset_code.strip()))
+    if stream_name:
+        q = q.filter(FlowmeterConfigHistory.stream_name.ilike(stream_name.strip()))
+    if meter_label:
+        q = q.filter(FlowmeterConfigHistory.meter_label.ilike(meter_label.strip()))
+
+    safe_limit = min(max(limit, 1), 5000)
+    rows = (
+        q.order_by(FlowmeterConfigHistory.changed_at.desc(), FlowmeterConfigHistory.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return [build_flowmeter_config_history_response(r) for r in rows]
+
+
+# -------------------------
+# Flowmeter Record APIs
+# -------------------------
+
+@app.get("/flowmeter-records", response_model=list[FlowmeterRecordResponse])
+def get_flowmeter_records(
+    location_code: str | None = None,
+    asset_code: str | None = None,
+    stream_name: str | None = None,
+    meter_label: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: int = 500,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Flowmeter Record", db)
+
+    def pick_value(values_map: dict, keys: list[str], default=None):
+        for key in keys:
+            if key in values_map and values_map[key] not in (None, ""):
+                return values_map[key]
+        return default
+
+    def to_float(value, default=0.0):
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    q = (
+        db.query(OperationTransaction)
+        .join(
+            OperationTemplate,
+            OperationTemplate.id == OperationTransaction.operation_template_id,
+        )
+        .filter(
+            OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            OperationTemplate.entry_layout_type == "Meter Reading",
+        )
+    )
+
+    if location_code:
+        q = q.filter(OperationTransaction.origin_location_code.ilike(location_code.strip()))
+    if asset_code:
+        q = q.filter(OperationTransaction.primary_asset_code.ilike(asset_code.strip()))
+    if date_from:
+        q = q.filter(OperationTransaction.operation_date >= date_from)
+    if date_to:
+        q = q.filter(OperationTransaction.operation_date <= date_to)
+
+    safe_limit = min(max(limit, 1), 2000)
+    transactions = (
+        q.order_by(OperationTransaction.operation_date.desc(), OperationTransaction.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+
+    output_rows = []
+
+    for transaction in transactions:
+        value_rows = (
+            db.query(OperationTransactionValue)
+            .filter(OperationTransactionValue.transaction_id == transaction.id)
+            .all()
+        )
+        values_map = {
+            str(v.field_code or ""): v.field_value
+            for v in value_rows
+            if str(v.field_code or "").strip() != ""
+        }
+
+        payload = pick_value(values_map, ["flowmeter_payload", "meter_payload"], default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload_inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+        payload_calc = payload.get("calculated") if isinstance(payload.get("calculated"), dict) else {}
+
+        meters = payload_inputs.get("meters") if isinstance(payload_inputs.get("meters"), list) else []
+        payload_stream_name = str(
+            pick_value(payload_inputs, ["stream_name", "streamName"], default="Default") or "Default"
+        ).strip() or "Default"
+        if stream_name and payload_stream_name.lower() != stream_name.strip().lower():
+            continue
+
+        if meters:
+            opening_reading = sum(to_float(m.get("opening_reading")) for m in meters)
+            closing_reading = sum(to_float(m.get("closing_reading")) for m in meters)
+            gross_observed = to_float(
+                payload_calc.get("stream_gross_observed_bbl", payload_calc.get("gross_observed_bbl", 0))
+            )
+            net_standard = to_float(payload_calc.get("gsv_bbl", 0))
+            net_standard_bbl = to_float(payload_calc.get("nsv_bbl", 0))
+            meter_factor = 1.0
+            meter_unit_clean = "bbls"
+            meter_label_value = payload_stream_name
+            if meter_label and meter_label_value.strip().lower() != meter_label.strip().lower():
+                continue
+        else:
+            meter_label_value = pick_value(
+                payload,
+                ["meterLabel", "meter_label", "meterName", "meter_name"],
+                default=None,
+            )
+            if meter_label_value is None:
+                meter_label_value = pick_value(
+                    values_map,
+                    ["meter_label", "meter_name", "meter_stream"],
+                    default="",
+                )
+
+            opening_reading = pick_value(
+                payload_inputs,
+                ["openingReading", "opening_reading", "openingMeterReading"],
+                default=None,
+            )
+            if opening_reading is None:
+                opening_reading = pick_value(
+                    values_map,
+                    ["opening_reading", "opening_meter_reading", "opening"],
+                    default=0,
+                )
+
+            closing_reading = pick_value(
+                payload_inputs,
+                ["closingReading", "closing_reading", "closingMeterReading"],
+                default=None,
+            )
+            if closing_reading is None:
+                closing_reading = pick_value(
+                    values_map,
+                    ["closing_reading", "closing_meter_reading", "closing"],
+                    default=0,
+                )
+
+            meter_factor = pick_value(
+                payload_inputs,
+                ["meterFactor", "meter_factor"],
+                default=None,
+            )
+            if meter_factor is None:
+                meter_factor = pick_value(values_map, ["meter_factor", "factor"], default=1)
+
+            meter_unit_value = pick_value(
+                payload_inputs,
+                ["meterUnit", "meter_unit", "unit"],
+                default=None,
+            )
+            if meter_unit_value is None:
+                meter_unit_value = pick_value(values_map, ["meter_unit", "unit"], default="bbls")
+
+            meter_unit_clean = str(meter_unit_value or "bbls").strip().lower()
+            if meter_unit_clean not in {"bbls", "m3"}:
+                meter_unit_clean = "bbls"
+
+            gross_observed = payload_calc.get("gross_observed")
+            if gross_observed is None:
+                gross_observed = max(to_float(closing_reading) - to_float(opening_reading), 0) * to_float(meter_factor, 1.0)
+            gross_observed = to_float(gross_observed)
+
+            net_standard = payload_calc.get("gsv_bbl")
+            if net_standard is None:
+                gross_observed_bbl = payload_calc.get("gross_observed_bbl")
+                if gross_observed_bbl is None:
+                    gross_observed_bbl = (
+                        gross_observed if meter_unit_clean == "bbls" else gross_observed * M3_TO_BBLS_FACTOR
+                    )
+                net_standard = to_float(gross_observed_bbl)
+            net_standard = to_float(net_standard)
+
+            net_standard_bbl = payload_calc.get("nsv_bbl")
+            if net_standard_bbl is None:
+                net_standard_bbl = net_standard
+            net_standard_bbl = to_float(net_standard_bbl)
+
+            if meter_label and str(meter_label_value or "").strip().lower() != meter_label.strip().lower():
+                continue
+
+        output_rows.append(
+            {
+                "id": transaction.id,
+                "location_code": transaction.origin_location_code,
+                "location_name": (
+                    db.query(Location.location_name)
+                    .filter(Location.location_code.ilike(transaction.origin_location_code))
+                    .scalar()
+                ),
+                "asset_code": transaction.primary_asset_code,
+                "asset_name": (
+                    db.query(Asset.asset_name)
+                    .filter(Asset.asset_code.ilike(transaction.primary_asset_code))
+                    .scalar()
+                ),
+                "stream_name": payload_stream_name,
+                "meter_label": str(meter_label_value or ""),
+                "reading_date": transaction.operation_date,
+                "opening_reading": to_float(opening_reading),
+                "closing_reading": to_float(closing_reading),
+                "gross_observed": gross_observed,
+                "meter_factor": to_float(meter_factor, 1.0),
+                "meter_unit": meter_unit_clean,
+                "net_standard": net_standard,
+                "net_standard_bbl": net_standard_bbl,
+                "remarks": transaction.remarks,
+                "status": transaction.status,
+                "created_by": transaction.created_by,
+                "created_at": transaction.created_at,
+                "updated_at": transaction.updated_at,
+            }
+        )
+
+    return output_rows
+
+
+@app.post("/flowmeter-records", response_model=FlowmeterRecordResponse)
+def create_flowmeter_record(
+    request: FlowmeterRecordCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Create Flowmeter Record", db)
+    create_audit_log(
+        db=db,
+        module_name="Flowmeter Record",
+        action="Direct Create Blocked",
+        current_user=current_user,
+        entity_type="FlowmeterRecord",
+        entity_id=None,
+        entity_label=f"{request.asset_code} / {request.meter_label}",
+        remarks="Direct flowmeter record creation blocked by policy",
+        request_path="/flowmeter-records",
+        details={
+            "location_code": request.location_code,
+            "asset_code": request.asset_code,
+            "meter_label": request.meter_label,
+            "reading_date": str(request.reading_date),
+        },
+    )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Direct Flowmeter Record creation is disabled. "
+            "Create Flowmeter entries via Operation Entry and approve the ticket."
+        ),
+    )
