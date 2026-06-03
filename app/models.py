@@ -16,9 +16,54 @@ class User(Base):
     department = Column(String(100), nullable=True)
     designation = Column(String(100), nullable=True)
     password_hash = Column(Text, nullable=False)
+    password_changed_at = Column(DateTime, nullable=True)
+    force_password_change = Column(String(20), nullable=False, default="No")
+    password_never_expires = Column(String(20), nullable=False, default="No")
+    password_expiry_days = Column(Integer, nullable=False, default=30)
+    failed_login_count = Column(Integer, nullable=False, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+    last_login_ip = Column(String(80), nullable=True)
+    totp_enabled = Column(String(20), nullable=False, default="No")
+    totp_secret_encrypted = Column(Text, nullable=True)
+    totp_confirmed_at = Column(DateTime, nullable=True)
+    force_2fa = Column(String(20), nullable=False, default="No")
+    backup_codes_hash_json = Column(JSONB, nullable=True)
     status = Column(String(20), nullable=False, default="Active")
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class AuthLoginChallenge(Base):
+    __tablename__ = "auth_login_challenges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    challenge_id = Column(String(120), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(30), nullable=False, default="Pending")
+    expires_at = Column(DateTime, nullable=False, index=True)
+    ip_address = Column(String(80), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    verified_at = Column(DateTime, nullable=True)
+
+
+class PasswordResetRequest(Base):
+    __tablename__ = "password_reset_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_number = Column(String(120), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    username = Column(String(80), nullable=False, index=True)
+    status = Column(String(30), nullable=False, default="Pending", index=True)
+    reason = Column(Text, nullable=True)
+    reset_2fa = Column(String(20), nullable=False, default="No")
+    requested_at = Column(DateTime, nullable=False, server_default=func.now())
+    requested_by_ip = Column(String(80), nullable=True)
+    task_id = Column(Integer, ForeignKey("operation_tasks.id"), nullable=True, index=True)
+    acted_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    acted_at = Column(DateTime, nullable=True)
+    action_notes = Column(Text, nullable=True)
 
 
 class OperationTransactionValue(Base):
@@ -175,6 +220,125 @@ class UserRole(Base):
             name="unique_user_role",
         ),
     )
+
+
+class OperationWorkflowPolicy(Base):
+    __tablename__ = "operation_workflow_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_name = Column(String(150), nullable=False)
+    action_code = Column(String(60), nullable=False, index=True)
+    operation_type_code = Column(String(50), nullable=True, index=True)
+    operation_template_id = Column(Integer, nullable=True, index=True)
+    asset_type_code = Column(String(50), nullable=True, index=True)
+    location_code = Column(String(50), nullable=True, index=True)
+    priority = Column(Integer, nullable=False, default=100)
+    status = Column(String(20), nullable=False, default="Active")
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class OperationWorkflowPolicyRole(Base):
+    __tablename__ = "operation_workflow_policy_roles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_id = Column(
+        Integer,
+        ForeignKey("operation_workflow_policies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role_id = Column(
+        Integer,
+        ForeignKey("roles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("policy_id", "role_id", name="uq_operation_workflow_policy_role"),
+    )
+
+
+class OperationWorkflowPolicyUser(Base):
+    __tablename__ = "operation_workflow_policy_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_id = Column(
+        Integer,
+        ForeignKey("operation_workflow_policies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    mode = Column(String(20), nullable=False, default="ALLOW")
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("policy_id", "user_id", name="uq_operation_workflow_policy_user"),
+    )
+
+
+class OperationTask(Base):
+    __tablename__ = "operation_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_number = Column(String(120), nullable=False, unique=True, index=True)
+    task_type = Column(String(80), nullable=False, default="OPERATION_APPROVAL", index=True)
+    transaction_id = Column(
+        Integer,
+        ForeignKey("operation_transactions.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    ticket_number = Column(String(120), nullable=True, index=True)
+    operation_number = Column(String(120), nullable=True, index=True)
+    operation_type_code = Column(String(50), nullable=True, index=True)
+    operation_template_id = Column(Integer, nullable=True, index=True)
+    asset_type_code = Column(String(50), nullable=True, index=True)
+    primary_asset_code = Column(String(80), nullable=True, index=True)
+    location_code = Column(String(50), nullable=True, index=True)
+    raised_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    assigned_policy_id = Column(Integer, ForeignKey("operation_workflow_policies.id"), nullable=True, index=True)
+    assigned_role_ids_json = Column(JSONB, nullable=True)
+    assigned_user_ids_json = Column(JSONB, nullable=True)
+    status = Column(String(30), nullable=False, default="Pending", index=True)
+    priority = Column(String(30), nullable=False, default="Normal", index=True)
+    due_at = Column(DateTime, nullable=True)
+    taken_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    taken_at = Column(DateTime, nullable=True)
+    acted_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    acted_at = Column(DateTime, nullable=True)
+    action_taken = Column(String(50), nullable=True)
+    remarks = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class OperationTaskEvent(Base):
+    __tablename__ = "operation_task_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(
+        Integer,
+        ForeignKey("operation_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_type = Column(String(80), nullable=False, index=True)
+    old_status = Column(String(30), nullable=True)
+    new_status = Column(String(30), nullable=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    actor_display = Column(String(150), nullable=True)
+    notes = Column(Text, nullable=True)
+    details = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 class Location(Base):
@@ -576,6 +740,101 @@ class OperationTemplateField(Base):
             "template_id",
             "field_code",
             name="unique_field_code_per_operation_template",
+        ),
+    )
+
+
+class OperationTemplateLayout(Base):
+    __tablename__ = "operation_template_layouts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_id = Column(
+        Integer,
+        ForeignKey("operation_templates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    layout_name = Column(String(150), nullable=False)
+    version_no = Column(Integer, nullable=False, default=1)
+    status = Column(String(20), nullable=False, default="Draft")  # Draft / Published / Archived
+    is_default = Column(String(10), nullable=False, default="No")  # Yes / No
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "template_id",
+            "layout_name",
+            "version_no",
+            name="unique_operation_template_layout_version",
+        ),
+    )
+
+
+class OperationTemplateLayoutSection(Base):
+    __tablename__ = "operation_template_layout_sections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    layout_id = Column(
+        Integer,
+        ForeignKey("operation_template_layouts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    section_key = Column(String(120), nullable=False)
+    title = Column(String(150), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=1)
+    collapsible = Column(String(10), nullable=False, default="No")
+    default_open = Column(String(10), nullable=False, default="Yes")
+    visibility_rule_json = Column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "layout_id",
+            "section_key",
+            name="unique_operation_template_layout_section_key",
+        ),
+    )
+
+
+class OperationTemplateLayoutItem(Base):
+    __tablename__ = "operation_template_layout_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    layout_id = Column(
+        Integer,
+        ForeignKey("operation_template_layouts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    section_id = Column(
+        Integer,
+        ForeignKey("operation_template_layout_sections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    field_id = Column(
+        Integer,
+        ForeignKey("operation_template_fields.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    row_no = Column(Integer, nullable=False, default=1)
+    col_start = Column(Integer, nullable=False, default=1)
+    col_span = Column(Integer, nullable=False, default=1)
+    sort_order = Column(Integer, nullable=False, default=1)
+
+    label_override = Column(String(150), nullable=True)
+    placeholder_override = Column(String(150), nullable=True)
+    read_only_override = Column(String(10), nullable=True)  # Yes / No / null
+    width_mode = Column(String(30), nullable=True)  # Auto / Compact / Full
+    rule_json = Column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "layout_id",
+            "field_id",
+            name="unique_operation_template_layout_field_placement",
         ),
     )
 

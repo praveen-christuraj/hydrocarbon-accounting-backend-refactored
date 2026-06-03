@@ -103,6 +103,135 @@ class UserRoleResponse(BaseModel):
     role_name: str
 
 
+class OperationWorkflowPolicyBase(BaseModel):
+    policy_name: str
+    action_code: str
+    operation_type_code: Optional[str] = None
+    operation_template_id: Optional[int] = None
+    asset_type_code: Optional[str] = None
+    location_code: Optional[str] = None
+    priority: int = 100
+    status: str = "Active"
+
+
+class OperationWorkflowPolicyRoleAssignRequest(BaseModel):
+    role_ids: list[int] = []
+
+
+class OperationWorkflowPolicyUserAssignItem(BaseModel):
+    user_id: int
+    mode: str = "ALLOW"
+
+
+class OperationWorkflowPolicyUserAssignRequest(BaseModel):
+    users: list[OperationWorkflowPolicyUserAssignItem] = []
+
+
+class OperationWorkflowPolicyCreate(OperationWorkflowPolicyBase):
+    role_ids: list[int] = []
+    users: list[OperationWorkflowPolicyUserAssignItem] = []
+
+
+class OperationWorkflowPolicyUpdate(BaseModel):
+    policy_name: Optional[str] = None
+    action_code: Optional[str] = None
+    operation_type_code: Optional[str] = None
+    operation_template_id: Optional[int] = None
+    asset_type_code: Optional[str] = None
+    location_code: Optional[str] = None
+    priority: Optional[int] = None
+    status: Optional[str] = None
+
+
+class OperationWorkflowPolicyRoleItem(BaseModel):
+    role_id: int
+    role_name: str
+
+
+class OperationWorkflowPolicyUserItem(BaseModel):
+    user_id: int
+    username: str
+    full_name: str
+    mode: str
+
+
+class OperationWorkflowPolicyResponse(OperationWorkflowPolicyBase):
+    id: int
+    roles: list[OperationWorkflowPolicyRoleItem] = []
+    users: list[OperationWorkflowPolicyUserItem] = []
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OperationWorkflowPolicyCheckRequest(BaseModel):
+    action_code: str
+    operation_type_code: Optional[str] = None
+    operation_template_id: Optional[int] = None
+    asset_type_code: Optional[str] = None
+    location_code: Optional[str] = None
+
+
+class OperationWorkflowPolicyCheckResponse(BaseModel):
+    allowed: bool
+    reason: str
+    matched_policy_id: Optional[int] = None
+    matched_policy_name: Optional[str] = None
+
+
+class OperationTaskActionRequest(BaseModel):
+    remarks: Optional[str] = None
+
+
+class OperationTaskResponse(BaseModel):
+    id: int
+    task_number: str
+    task_type: str
+    transaction_id: Optional[int] = None
+    ticket_number: Optional[str] = None
+    operation_number: Optional[str] = None
+    operation_type_code: Optional[str] = None
+    operation_template_id: Optional[int] = None
+    asset_type_code: Optional[str] = None
+    primary_asset_code: Optional[str] = None
+    location_code: Optional[str] = None
+    raised_by_user_id: Optional[int] = None
+    assigned_policy_id: Optional[int] = None
+    assigned_role_ids_json: Optional[Any] = None
+    assigned_user_ids_json: Optional[Any] = None
+    status: str
+    priority: str
+    due_at: Optional[datetime] = None
+    taken_by_user_id: Optional[int] = None
+    taken_at: Optional[datetime] = None
+    acted_by_user_id: Optional[int] = None
+    acted_at: Optional[datetime] = None
+    action_taken: Optional[str] = None
+    remarks: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    transaction: Optional[Any] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OperationTaskEventResponse(BaseModel):
+    id: int
+    task_id: int
+    event_type: str
+    old_status: Optional[str] = None
+    new_status: Optional[str] = None
+    actor_user_id: Optional[int] = None
+    actor_display: Optional[str] = None
+    notes: Optional[str] = None
+    details: Optional[Any] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class LocationBase(BaseModel):
     location_name: str
     location_code: str
@@ -1273,6 +1402,7 @@ class OperationTransactionCreate(OperationTransactionBase):
 class OperationTransactionResponse(OperationTransactionBase):
     id: int
     operation_number: str
+    operation_template_id: Optional[int] = None
     operation_ticket_number: Optional[str] = None
     ticket_number: Optional[str] = None
     primary_asset_type_code: str
@@ -1916,6 +2046,82 @@ class DashboardConfigResponse(BaseModel):
     remarks: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OperationTemplateLayoutSectionBase(BaseModel):
+    section_key: str
+    title: str
+    sort_order: int = 1
+    collapsible: str = "No"
+    default_open: str = "Yes"
+    visibility_rule_json: Optional[dict[str, Any]] = None
+
+
+class OperationTemplateLayoutSectionCreate(OperationTemplateLayoutSectionBase):
+    pass
+
+
+class OperationTemplateLayoutSectionResponse(OperationTemplateLayoutSectionBase):
+    id: int
+    layout_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OperationTemplateLayoutItemBase(BaseModel):
+    section_id: int
+    field_id: int
+    row_no: int = 1
+    col_start: int = 1
+    col_span: int = 1
+    sort_order: int = 1
+    label_override: Optional[str] = None
+    placeholder_override: Optional[str] = None
+    read_only_override: Optional[str] = None
+    width_mode: Optional[str] = None
+    rule_json: Optional[dict[str, Any]] = None
+
+
+class OperationTemplateLayoutItemCreate(OperationTemplateLayoutItemBase):
+    pass
+
+
+class OperationTemplateLayoutItemResponse(OperationTemplateLayoutItemBase):
+    id: int
+    layout_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OperationTemplateLayoutBase(BaseModel):
+    layout_name: str
+    version_no: int = 1
+    status: str = "Draft"
+    is_default: str = "No"
+
+
+class OperationTemplateLayoutCreate(OperationTemplateLayoutBase):
+    sections: list[OperationTemplateLayoutSectionCreate] = []
+    items: list[OperationTemplateLayoutItemCreate] = []
+
+
+class OperationTemplateLayoutUpdate(BaseModel):
+    layout_name: Optional[str] = None
+    status: Optional[str] = None
+    is_default: Optional[str] = None
+    sections: Optional[list[OperationTemplateLayoutSectionCreate]] = None
+    items: Optional[list[OperationTemplateLayoutItemCreate]] = None
+
+
+class OperationTemplateLayoutResponse(OperationTemplateLayoutBase):
+    id: int
+    template_id: int
+    created_at: datetime
+    updated_at: datetime
+    sections: list[OperationTemplateLayoutSectionResponse] = []
+    items: list[OperationTemplateLayoutItemResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
 

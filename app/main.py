@@ -4,9 +4,16 @@ from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
 import csv
 import io
+import base64
+import hashlib
+import json
+import secrets
 from jose import JWTError, jwt
 import openpyxl
 from openpyxl.utils import get_column_letter
+import pyotp
+import qrcode
+from cryptography.fernet import Fernet
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -40,6 +47,7 @@ from sqlalchemy.orm import Session
 from app.database import Base, engine, get_db
 from app.models import (
     Asset,
+    AuthLoginChallenge,
     AssetAssignment,
     PrimeMoverTankerLink,
     AssetCalibrationData,
@@ -52,6 +60,9 @@ from app.models import (
     LocationOperationAvailability,
     OperationTemplate,
     OperationTemplateField,
+    OperationTemplateLayout,
+    OperationTemplateLayoutSection,
+    OperationTemplateLayoutItem,
     OperationTransaction,
     OperationTransactionValue,
     OperationTransactionStatusHistory,
@@ -70,7 +81,13 @@ from app.models import (
     Role,
     RolePermission,
     User,
+    PasswordResetRequest,
     UserRole,
+    OperationWorkflowPolicy,
+    OperationWorkflowPolicyRole,
+    OperationWorkflowPolicyUser,
+    OperationTask,
+    OperationTaskEvent,
     Table11Factor,
     BargeSealMaster,
     FlowmeterConfig,
@@ -118,6 +135,9 @@ from app.schemas import (
     TankerTrackingClosureCreate,
     OperationTemplateCreate,
     OperationTemplateResponse,
+    OperationTemplateLayoutCreate,
+    OperationTemplateLayoutUpdate,
+    OperationTemplateLayoutResponse,
     OperationTransactionCreate,
     OperationTransactionResponse,
     OperationTransactionRegisterPagedResponse,
@@ -160,6 +180,16 @@ from app.schemas import (
     UserResponse,
     UserRoleResponse,
     UserRoleSaveRequest,
+    OperationWorkflowPolicyCreate,
+    OperationWorkflowPolicyUpdate,
+    OperationWorkflowPolicyResponse,
+    OperationWorkflowPolicyRoleAssignRequest,
+    OperationWorkflowPolicyUserAssignRequest,
+    OperationWorkflowPolicyCheckRequest,
+    OperationWorkflowPolicyCheckResponse,
+    OperationTaskActionRequest,
+    OperationTaskResponse,
+    OperationTaskEventResponse,
     UserUpdate,
     Table11FactorBulkCreate,
     Table11FactorCreate,
@@ -215,12 +245,157 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class TwoFAVerifyRequest(BaseModel):
+    challenge_id: str
+    code: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    username: str
+    reason: str | None = None
+    reset_2fa: bool = False
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str
+    force_password_change: bool = True
+    reset_2fa: bool = False
+    remarks: str | None = None
+
+
+class TwoFASetupVerifyRequest(BaseModel):
+    code: str
+
+
+class TwoFADisableRequest(BaseModel):
+    current_password: str
+    code: str
+
+
 def hash_password(password: str):
     return password_context.hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str):
     return password_context.verify(plain_password, hashed_password)
+
+
+def normalize_yes_no(value):
+    return "Yes" if str(value or "").strip().lower() in {"yes", "true", "1"} else "No"
+
+
+def get_fernet():
+    key = base64.urlsafe_b64encode(hashlib.sha256(JWT_SECRET_KEY.encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def encrypt_security_value(value: str | None):
+    if value is None:
+        return None
+    return get_fernet().encrypt(value.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_security_value(value: str | None):
+    if not value:
+        return None
+    return get_fernet().decrypt(value.encode("utf-8")).decode("utf-8")
+
+
+def validate_password_policy(new_password: str, current_password: str | None = None):
+    password = str(new_password or "")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
+    if current_password is not None and password == current_password:
+        raise HTTPException(status_code=400, detail="New password must be different from current password")
+    if not any(ch.isupper() for ch in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one uppercase letter")
+    if not any(ch.islower() for ch in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one lowercase letter")
+    if not any(ch.isdigit() for ch in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one number")
+    if not any(not ch.isalnum() for ch in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one special character")
+
+
+def is_password_expired(user: User):
+    if normalize_yes_no(getattr(user, "password_never_expires", "No")) == "Yes":
+        return False
+    changed_at = getattr(user, "password_changed_at", None)
+    if not changed_at:
+        return False
+    expiry_days = int(getattr(user, "password_expiry_days", 30) or 30)
+    return datetime.utcnow() >= changed_at + timedelta(days=expiry_days)
+
+
+def build_security_flags(user: User):
+    return {
+        "force_password_change": normalize_yes_no(getattr(user, "force_password_change", "No")) == "Yes",
+        "password_expired": is_password_expired(user),
+        "totp_enabled": normalize_yes_no(getattr(user, "totp_enabled", "No")) == "Yes",
+        "force_2fa": normalize_yes_no(getattr(user, "force_2fa", "No")) == "Yes",
+    }
+
+
+def generate_backup_codes(count: int = 10):
+    codes = []
+    for _ in range(count):
+        raw = "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(10))
+        codes.append(f"{raw[:5]}-{raw[5:]}")
+    return codes
+
+
+def hash_backup_codes(codes: list[str]):
+    return [hash_password(code.upper()) for code in codes]
+
+
+def verify_backup_code(user: User, code: str):
+    entered = str(code or "").strip().upper()
+    hashes = list(getattr(user, "backup_codes_hash_json", None) or [])
+    for idx, code_hash in enumerate(hashes):
+        if verify_password(entered, code_hash):
+            hashes.pop(idx)
+            user.backup_codes_hash_json = hashes
+            return True
+    return False
+
+
+def verify_totp_or_backup_code(user: User, code: str):
+    secret = decrypt_security_value(getattr(user, "totp_secret_encrypted", None))
+    normalized = "".join(ch for ch in str(code or "").strip() if ch.isdigit())
+    if secret and len(normalized) == 6:
+        totp = pyotp.TOTP(secret)
+        if totp.verify(normalized, valid_window=1):
+            return True
+    return verify_backup_code(user, code)
+
+
+def build_totp_qr_data_url(provisioning_uri: str):
+    qr = qrcode.QRCode(version=1, box_size=8, border=4)
+    qr.add_data(provisioning_uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    stream = io.BytesIO()
+    img.save(stream, format="PNG")
+    encoded = base64.b64encode(stream.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def create_login_challenge(db: Session, user: User):
+    challenge = AuthLoginChallenge(
+        challenge_id=secrets.token_urlsafe(32),
+        user_id=user.id,
+        status="Pending",
+        expires_at=datetime.utcnow() + timedelta(minutes=5),
+    )
+    db.add(challenge)
+    db.flush()
+    return challenge
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     token_data = data.copy()
@@ -367,6 +542,332 @@ def get_required_permission_for_status_change(next_status: str):
 
     return status_permission_map.get(next_status)
 
+
+def get_action_code_for_status_change(next_status: str):
+    status_action_map = {
+        "Draft": "RECALL",
+        "Submitted": "SUBMIT",
+        "Approved": "APPROVE",
+        "Rejected": "REJECT",
+        "Cancelled": "CANCEL",
+    }
+    return status_action_map.get(next_status)
+
+
+def evaluate_operation_workflow_policy(
+    db: Session,
+    current_user: User,
+    action_code: str,
+    operation_type_code: str | None,
+    operation_template_id: int | None,
+    asset_type_code: str | None,
+    location_code: str | None,
+):
+    policies = (
+        db.query(OperationWorkflowPolicy)
+        .filter(
+            OperationWorkflowPolicy.status == "Active",
+            OperationWorkflowPolicy.action_code == action_code,
+        )
+        .order_by(OperationWorkflowPolicy.priority.asc(), OperationWorkflowPolicy.id.asc())
+        .all()
+    )
+
+    def matches(policy: OperationWorkflowPolicy):
+        if policy.operation_type_code and policy.operation_type_code != operation_type_code:
+            return False
+        if policy.operation_template_id and policy.operation_template_id != operation_template_id:
+            return False
+        if policy.asset_type_code and policy.asset_type_code != asset_type_code:
+            return False
+        if policy.location_code and policy.location_code != location_code:
+            return False
+        return True
+
+    matched = [p for p in policies if matches(p)]
+    if len(matched) == 0:
+        return None, "No active workflow policy matched this action/context", None
+
+    user_role_ids = {
+        row.role_id
+        for row in db.query(UserRole).filter(UserRole.user_id == current_user.id).all()
+    }
+
+    for policy in matched:
+        direct_user = (
+            db.query(OperationWorkflowPolicyUser)
+            .filter(
+                OperationWorkflowPolicyUser.policy_id == policy.id,
+                OperationWorkflowPolicyUser.user_id == current_user.id,
+            )
+            .first()
+        )
+        if direct_user:
+            if str(direct_user.mode or "ALLOW").upper() == "DENY":
+                return False, "Denied by user override in workflow policy", policy
+            return True, "Allowed by user override in workflow policy", policy
+
+        allowed_role_ids = {
+            row.role_id
+            for row in db.query(OperationWorkflowPolicyRole).filter(
+                OperationWorkflowPolicyRole.policy_id == policy.id
+            ).all()
+        }
+        if allowed_role_ids.intersection(user_role_ids):
+            return True, "Allowed by role in workflow policy", policy
+
+    return False, "No matching role/user allowance in matched workflow policies", matched[0]
+
+
+def find_matching_operation_workflow_policy(
+    db: Session,
+    action_code: str,
+    operation_type_code: str | None,
+    operation_template_id: int | None,
+    asset_type_code: str | None,
+    location_code: str | None,
+):
+    policies = (
+        db.query(OperationWorkflowPolicy)
+        .filter(
+            OperationWorkflowPolicy.status == "Active",
+            OperationWorkflowPolicy.action_code == action_code,
+        )
+        .order_by(OperationWorkflowPolicy.priority.asc(), OperationWorkflowPolicy.id.asc())
+        .all()
+    )
+
+    for policy in policies:
+        if policy.operation_type_code and policy.operation_type_code != operation_type_code:
+            continue
+        if policy.operation_template_id and policy.operation_template_id != operation_template_id:
+            continue
+        if policy.asset_type_code and policy.asset_type_code != asset_type_code:
+            continue
+        if policy.location_code and policy.location_code != location_code:
+            continue
+        return policy
+
+    return None
+
+
+def get_role_ids_with_permission(db: Session, permission_name: str):
+    rows = (
+        db.query(Role.id)
+        .join(RolePermission, RolePermission.role_id == Role.id)
+        .join(Permission, Permission.id == RolePermission.permission_id)
+        .filter(
+            Permission.permission_name.ilike(permission_name),
+            Permission.status == "Active",
+            Role.status == "Active",
+        )
+        .all()
+    )
+    return [row[0] for row in rows]
+
+
+def generate_operation_task_number(db: Session):
+    today = datetime.now().strftime("%Y%m%d")
+    prefix = f"TASK-{today}"
+    count = db.query(OperationTask).filter(OperationTask.task_number.ilike(f"{prefix}%")).count()
+    return f"{prefix}-{count + 1:04d}"
+
+
+def add_operation_task_event(
+    db: Session,
+    task: OperationTask,
+    event_type: str,
+    current_user: User | None = None,
+    old_status: str | None = None,
+    new_status: str | None = None,
+    notes: str | None = None,
+    details: dict | None = None,
+):
+    event = OperationTaskEvent(
+        task_id=task.id,
+        event_type=event_type,
+        old_status=old_status,
+        new_status=new_status,
+        actor_user_id=current_user.id if current_user else None,
+        actor_display=get_current_user_display_name(current_user) if current_user else None,
+        notes=notes,
+        details=jsonable_encoder(details) if details is not None else None,
+    )
+    db.add(event)
+    return event
+
+
+def get_user_role_ids(db: Session, user: User):
+    return {
+        row.role_id
+        for row in db.query(UserRole).filter(UserRole.user_id == user.id).all()
+    }
+
+
+def user_can_act_on_operation_task(db: Session, user: User, task: OperationTask):
+    role_names = {
+        str(r.role_name or "").lower()
+        for r in (
+            db.query(Role)
+            .join(UserRole, UserRole.role_id == Role.id)
+            .filter(UserRole.user_id == user.id)
+            .all()
+        )
+    }
+    if "admin" in role_names:
+        return True
+
+    assigned_user_ids = set(task.assigned_user_ids_json or [])
+    if user.id in assigned_user_ids:
+        return True
+
+    assigned_role_ids = set(task.assigned_role_ids_json or [])
+    return len(assigned_role_ids.intersection(get_user_role_ids(db, user))) > 0
+
+
+def create_operation_approval_task_for_transaction(
+    db: Session,
+    transaction: OperationTransaction,
+    current_user: User,
+):
+    existing = (
+        db.query(OperationTask)
+        .filter(
+            OperationTask.transaction_id == transaction.id,
+            OperationTask.task_type == "OPERATION_APPROVAL",
+            OperationTask.status.in_(["Pending", "In Progress"]),
+        )
+        .first()
+    )
+    if existing:
+        return existing
+
+    policy = find_matching_operation_workflow_policy(
+        db=db,
+        action_code="APPROVE",
+        operation_type_code=clean_optional_text(transaction.operation_type_code),
+        operation_template_id=transaction.operation_template_id,
+        asset_type_code=clean_optional_text(transaction.primary_asset_type_code),
+        location_code=clean_optional_text(transaction.origin_location_code),
+    )
+
+    assigned_role_ids = []
+    assigned_user_ids = []
+    if policy:
+        assigned_role_ids = [
+            row.role_id
+            for row in db.query(OperationWorkflowPolicyRole)
+            .filter(OperationWorkflowPolicyRole.policy_id == policy.id)
+            .all()
+        ]
+        assigned_user_ids = [
+            row.user_id
+            for row in db.query(OperationWorkflowPolicyUser)
+            .filter(
+                OperationWorkflowPolicyUser.policy_id == policy.id,
+                OperationWorkflowPolicyUser.mode == "ALLOW",
+            )
+            .all()
+        ]
+
+    if not assigned_role_ids and not assigned_user_ids:
+        assigned_role_ids = get_role_ids_with_permission(db, "Approve Operation Transaction")
+
+    task = OperationTask(
+        task_number=generate_operation_task_number(db),
+        task_type="OPERATION_APPROVAL",
+        transaction_id=transaction.id,
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        operation_type_code=transaction.operation_type_code,
+        operation_template_id=transaction.operation_template_id,
+        asset_type_code=transaction.primary_asset_type_code,
+        primary_asset_code=transaction.primary_asset_code,
+        location_code=transaction.origin_location_code,
+        raised_by_user_id=current_user.id,
+        assigned_policy_id=policy.id if policy else None,
+        assigned_role_ids_json=assigned_role_ids,
+        assigned_user_ids_json=assigned_user_ids,
+        status="Pending",
+        priority="Normal",
+    )
+    db.add(task)
+    db.flush()
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Created",
+        current_user=current_user,
+        new_status="Pending",
+        details={
+            "assigned_policy_id": task.assigned_policy_id,
+            "assigned_role_ids": assigned_role_ids,
+            "assigned_user_ids": assigned_user_ids,
+        },
+    )
+    return task
+
+
+def close_operation_approval_tasks_for_transaction(
+    db: Session,
+    transaction: OperationTransaction,
+    current_user: User,
+    task_status: str,
+    action_taken: str,
+    notes: str | None = None,
+):
+    tasks = (
+        db.query(OperationTask)
+        .filter(
+            OperationTask.transaction_id == transaction.id,
+            OperationTask.task_type == "OPERATION_APPROVAL",
+            OperationTask.status.in_(["Pending", "In Progress"]),
+        )
+        .all()
+    )
+    for task in tasks:
+        old_status = task.status
+        task.status = task_status
+        task.action_taken = action_taken
+        task.acted_by_user_id = current_user.id
+        task.acted_at = datetime.now()
+        task.remarks = notes
+        task.updated_at = datetime.now()
+        add_operation_task_event(
+            db=db,
+            task=task,
+            event_type=action_taken,
+            current_user=current_user,
+            old_status=old_status,
+            new_status=task_status,
+            notes=notes,
+        )
+        create_audit_log(
+            db=db,
+            module_name="Operation Task",
+            action=f"Task {action_taken}",
+            current_user=current_user,
+            entity_type="OperationTask",
+            entity_id=task.id,
+            entity_label=task.task_number,
+            ticket_number=task.ticket_number,
+            operation_number=task.operation_number,
+            old_status=old_status,
+            new_status=task.status,
+            remarks=notes or "",
+            request_path=f"/operation-tasks/{task.id}",
+            details={
+                "task_type": task.task_type,
+                "transaction_id": task.transaction_id,
+                "operation_type_code": task.operation_type_code,
+                "operation_template_id": task.operation_template_id,
+                "asset_type_code": task.asset_type_code,
+                "primary_asset_code": task.primary_asset_code,
+                "location_code": task.location_code,
+                "action_taken": action_taken,
+            },
+        )
+
 def build_logged_in_user_response(user: User, db: Session):
     user_role_assignment = (
         db.query(UserRole, Role)
@@ -416,6 +917,7 @@ def build_logged_in_user_response(user: User, db: Session):
         "department": user.department,
         "designation": user.designation,
         "status": user.status,
+        "security": build_security_flags(user),
         "role": role_data,
         "permissions": permissions_data,
     }
@@ -913,7 +1415,174 @@ def ensure_barge_event_type_template_field():
     finally:
         db.close()
 
+def ensure_operation_workflow_policy_tables():
+    with engine.connect() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS operation_workflow_policies (
+                    id SERIAL PRIMARY KEY,
+                    policy_name VARCHAR(150) NOT NULL,
+                    action_code VARCHAR(60) NOT NULL,
+                    operation_type_code VARCHAR(50),
+                    operation_template_id INTEGER,
+                    asset_type_code VARCHAR(50),
+                    location_code VARCHAR(50),
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    status VARCHAR(20) NOT NULL DEFAULT 'Active',
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS operation_workflow_policy_roles (
+                    id SERIAL PRIMARY KEY,
+                    policy_id INTEGER NOT NULL REFERENCES operation_workflow_policies(id) ON DELETE CASCADE,
+                    role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_operation_workflow_policy_role UNIQUE (policy_id, role_id)
+                );
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS operation_workflow_policy_users (
+                    id SERIAL PRIMARY KEY,
+                    policy_id INTEGER NOT NULL REFERENCES operation_workflow_policies(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    mode VARCHAR(20) NOT NULL DEFAULT 'ALLOW',
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_operation_workflow_policy_user UNIQUE (policy_id, user_id)
+                );
+                """
+            )
+        )
+        connection.commit()
+
+
+def ensure_operation_task_tables():
+    with engine.connect() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS operation_tasks (
+                    id SERIAL PRIMARY KEY,
+                    task_number VARCHAR(120) NOT NULL UNIQUE,
+                    task_type VARCHAR(80) NOT NULL DEFAULT 'OPERATION_APPROVAL',
+                    transaction_id INTEGER REFERENCES operation_transactions(id) ON DELETE CASCADE,
+                    ticket_number VARCHAR(120),
+                    operation_number VARCHAR(120),
+                    operation_type_code VARCHAR(50),
+                    operation_template_id INTEGER,
+                    asset_type_code VARCHAR(50),
+                    primary_asset_code VARCHAR(80),
+                    location_code VARCHAR(50),
+                    raised_by_user_id INTEGER REFERENCES users(id),
+                    assigned_policy_id INTEGER REFERENCES operation_workflow_policies(id),
+                    assigned_role_ids_json JSONB,
+                    assigned_user_ids_json JSONB,
+                    status VARCHAR(30) NOT NULL DEFAULT 'Pending',
+                    priority VARCHAR(30) NOT NULL DEFAULT 'Normal',
+                    due_at TIMESTAMP,
+                    taken_by_user_id INTEGER REFERENCES users(id),
+                    taken_at TIMESTAMP,
+                    acted_by_user_id INTEGER REFERENCES users(id),
+                    acted_at TIMESTAMP,
+                    action_taken VARCHAR(50),
+                    remarks TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS operation_task_events (
+                    id SERIAL PRIMARY KEY,
+                    task_id INTEGER NOT NULL REFERENCES operation_tasks(id) ON DELETE CASCADE,
+                    event_type VARCHAR(80) NOT NULL,
+                    old_status VARCHAR(30),
+                    new_status VARCHAR(30),
+                    actor_user_id INTEGER REFERENCES users(id),
+                    actor_display VARCHAR(150),
+                    notes TEXT,
+                    details JSONB,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                ALTER TABLE operation_tasks
+                ALTER COLUMN transaction_id DROP NOT NULL;
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_operation_tasks_user_lookup
+                ON operation_tasks(status, task_type, location_code, operation_type_code);
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_operation_tasks_active_approval
+                ON operation_tasks(transaction_id)
+                WHERE task_type = 'OPERATION_APPROVAL' AND status IN ('Pending', 'In Progress');
+                """
+            )
+        )
+        connection.commit()
+
+
+def ensure_user_security_columns():
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    column_sql = {
+        "password_changed_at": "ALTER TABLE users ADD COLUMN password_changed_at TIMESTAMP;",
+        "force_password_change": "ALTER TABLE users ADD COLUMN force_password_change VARCHAR(20) DEFAULT 'No';",
+        "password_never_expires": "ALTER TABLE users ADD COLUMN password_never_expires VARCHAR(20) DEFAULT 'No';",
+        "password_expiry_days": "ALTER TABLE users ADD COLUMN password_expiry_days INTEGER DEFAULT 30;",
+        "failed_login_count": "ALTER TABLE users ADD COLUMN failed_login_count INTEGER DEFAULT 0;",
+        "locked_until": "ALTER TABLE users ADD COLUMN locked_until TIMESTAMP;",
+        "last_login_at": "ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP;",
+        "last_login_ip": "ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(80);",
+        "totp_enabled": "ALTER TABLE users ADD COLUMN totp_enabled VARCHAR(20) DEFAULT 'No';",
+        "totp_secret_encrypted": "ALTER TABLE users ADD COLUMN totp_secret_encrypted TEXT;",
+        "totp_confirmed_at": "ALTER TABLE users ADD COLUMN totp_confirmed_at TIMESTAMP;",
+        "force_2fa": "ALTER TABLE users ADD COLUMN force_2fa VARCHAR(20) DEFAULT 'No';",
+        "backup_codes_hash_json": "ALTER TABLE users ADD COLUMN backup_codes_hash_json JSONB;",
+    }
+
+    with engine.begin() as connection:
+        for col_name, sql in column_sql.items():
+            if col_name not in cols:
+                connection.execute(text(sql))
+        connection.execute(text("UPDATE users SET force_password_change = 'No' WHERE force_password_change IS NULL;"))
+        connection.execute(text("UPDATE users SET password_never_expires = 'No' WHERE password_never_expires IS NULL;"))
+        connection.execute(text("UPDATE users SET password_expiry_days = 30 WHERE password_expiry_days IS NULL;"))
+        connection.execute(text("UPDATE users SET failed_login_count = 0 WHERE failed_login_count IS NULL;"))
+        connection.execute(text("UPDATE users SET totp_enabled = 'No' WHERE totp_enabled IS NULL;"))
+        connection.execute(text("UPDATE users SET force_2fa = 'No' WHERE force_2fa IS NULL;"))
+
 Base.metadata.create_all(bind=engine)
+ensure_user_security_columns()
 ensure_operation_ticket_number_column()
 ensure_operation_template_layout_columns()
 ensure_tank_stock_ledger_accounting_columns()
@@ -921,6 +1590,8 @@ ensure_tank_stock_ledger_stock_snapshot_columns()
 ensure_vessel_operation_show_in_column()
 ensure_flowmeter_stream_columns()
 ensure_barge_event_type_template_field()
+ensure_operation_workflow_policy_tables()
+ensure_operation_task_tables()
 
 
 @app.get("/")
@@ -986,11 +1657,71 @@ def login_user(
             detail="User is not Active",
         )
 
+    if user.locked_until and user.locked_until > datetime.utcnow():
+        create_audit_log(
+            db=db,
+            module_name="Authentication",
+            action="Login Blocked",
+            current_user=user,
+            entity_type="User",
+            entity_id=user.id,
+            entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
+            remarks="User account temporarily locked",
+            request_path="/auth/login",
+            details={"username": user.username, "locked_until": user.locked_until.isoformat()},
+        )
+        db.commit()
+        raise HTTPException(status_code=423, detail="Account is temporarily locked. Please try again later.")
+
     if not verify_password(login_request.password, user.password_hash):
+        user.failed_login_count = int(user.failed_login_count or 0) + 1
+        if user.failed_login_count >= 5:
+            user.locked_until = datetime.utcnow() + timedelta(minutes=15)
+        create_audit_log(
+            db=db,
+            module_name="Authentication",
+            action="Login Failed",
+            current_user=user,
+            entity_type="User",
+            entity_id=user.id,
+            entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
+            remarks="Invalid password",
+            request_path="/auth/login",
+            details={"username": user.username, "failed_login_count": user.failed_login_count},
+        )
+        db.commit()
         raise HTTPException(
             status_code=401,
             detail="Invalid username or password",
         )
+
+    user.failed_login_count = 0
+    user.locked_until = None
+
+    if normalize_yes_no(getattr(user, "totp_enabled", "No")) == "Yes":
+        challenge = create_login_challenge(db, user)
+        create_audit_log(
+            db=db,
+            module_name="Authentication",
+            action="Login 2FA Required",
+            current_user=user,
+            entity_type="User",
+            entity_id=user.id,
+            entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
+            remarks="Password verified; waiting for 2FA verification",
+            request_path="/auth/login",
+            details={"challenge_id": challenge.challenge_id},
+        )
+        db.commit()
+        return {
+            "message": "Two-factor authentication required",
+            "requires_2fa": True,
+            "challenge_id": challenge.challenge_id,
+            "user_hint": {
+                "full_name": user.full_name,
+                "username": user.username,
+            },
+        }
 
     logged_in_user = build_logged_in_user_response(user, db)
 
@@ -1000,6 +1731,8 @@ def login_user(
             "username": user.username,
         }
     )
+
+    user.last_login_at = datetime.utcnow()
 
     create_audit_log(
         db=db,
@@ -1016,9 +1749,83 @@ def login_user(
             "user_status": user.status,
         },
     )
+    db.commit()
 
     return {
         "message": "Login successful",
+        "requires_2fa": False,
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": logged_in_user,
+        "role": logged_in_user["role"],
+        "permissions": logged_in_user["permissions"],
+    }
+
+
+@app.post("/auth/2fa/verify")
+def verify_login_2fa(
+    verify_request: TwoFAVerifyRequest,
+    db: Session = Depends(get_db),
+):
+    challenge = (
+        db.query(AuthLoginChallenge)
+        .filter(AuthLoginChallenge.challenge_id == verify_request.challenge_id)
+        .first()
+    )
+    if not challenge or challenge.status != "Pending" or challenge.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Invalid or expired 2FA challenge")
+
+    user = db.query(User).filter(User.id == challenge.user_id).first()
+    if not user or user.status != "Active":
+        raise HTTPException(status_code=401, detail="Invalid 2FA challenge")
+
+    if not verify_totp_or_backup_code(user, verify_request.code):
+        create_audit_log(
+            db=db,
+            module_name="Authentication",
+            action="2FA Failed",
+            current_user=user,
+            entity_type="User",
+            entity_id=user.id,
+            entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
+            remarks="Invalid 2FA code",
+            request_path="/auth/2fa/verify",
+            details={"challenge_id": challenge.challenge_id},
+        )
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid authentication code")
+
+    challenge.status = "Verified"
+    challenge.verified_at = datetime.utcnow()
+    user.last_login_at = datetime.utcnow()
+    user.failed_login_count = 0
+    user.locked_until = None
+
+    logged_in_user = build_logged_in_user_response(user, db)
+    access_token = create_access_token(
+        data={
+            "user_id": user.id,
+            "username": user.username,
+        }
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Authentication",
+        action="2FA Success",
+        current_user=user,
+        entity_type="User",
+        entity_id=user.id,
+        entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
+        remarks="2FA verification successful",
+        request_path="/auth/2fa/verify",
+        details={"challenge_id": challenge.challenge_id},
+    )
+    db.commit()
+
+    return {
+        "message": "Login successful",
+        "requires_2fa": False,
         "access_token": access_token,
         "token_type": "bearer",
         "user": logged_in_user,
@@ -1038,6 +1845,355 @@ def get_logged_in_user(
         "role": logged_in_user["role"],
         "permissions": logged_in_user["permissions"],
     }
+
+
+def generate_password_reset_request_number(db: Session):
+    today = datetime.now().strftime("%Y%m%d")
+    prefix = f"PWR-{today}"
+    count = db.query(PasswordResetRequest).filter(
+        PasswordResetRequest.request_number.ilike(f"{prefix}%")
+    ).count()
+    return f"{prefix}-{count + 1:04d}"
+
+
+@app.post("/auth/change-password")
+def change_own_password(
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Own Security Settings", db)
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="New password and confirmation do not match")
+    validate_password_policy(payload.new_password, payload.current_password)
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    current_user.password_hash = hash_password(payload.new_password)
+    current_user.password_changed_at = datetime.utcnow()
+    current_user.force_password_change = "No"
+    current_user.failed_login_count = 0
+    current_user.locked_until = None
+    current_user.updated_at = datetime.now()
+
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Change Own Password",
+        current_user=current_user,
+        entity_type="User",
+        entity_id=current_user.id,
+        entity_label=f"{current_user.full_name} ({current_user.username})",
+        remarks="User changed own password",
+        request_path="/auth/change-password",
+        details={"password_changed": True},
+    )
+    db.commit()
+    return {"message": "Password changed successfully"}
+
+
+@app.post("/auth/forgot-password")
+def request_password_reset(
+    payload: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    username = str(payload.username or "").strip()
+    if username == "":
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    user = db.query(User).filter(User.username.ilike(username)).first()
+    # Avoid user enumeration: return success even when user is absent/inactive.
+    if not user or user.status != "Active":
+        return {"message": "If the account exists, a reset request has been submitted"}
+
+    existing = (
+        db.query(PasswordResetRequest)
+        .filter(
+            PasswordResetRequest.user_id == user.id,
+            PasswordResetRequest.status == "Pending",
+        )
+        .first()
+    )
+    if existing:
+        return {"message": "If the account exists, a reset request has been submitted"}
+
+    reset_request = PasswordResetRequest(
+        request_number=generate_password_reset_request_number(db),
+        user_id=user.id,
+        username=user.username,
+        status="Pending",
+        reason=clean_optional_text(payload.reason),
+        reset_2fa="Yes" if payload.reset_2fa else "No",
+    )
+    db.add(reset_request)
+    db.flush()
+
+    role_ids = get_role_ids_with_permission(db, "Reset User Password")
+    task = OperationTask(
+        task_number=generate_operation_task_number(db),
+        task_type="PASSWORD_RESET_REQUEST",
+        transaction_id=None,
+        ticket_number=reset_request.request_number,
+        operation_number=reset_request.request_number,
+        raised_by_user_id=user.id,
+        assigned_role_ids_json=role_ids,
+        assigned_user_ids_json=[],
+        status="Pending",
+        priority="High",
+        remarks=reset_request.reason,
+    )
+    db.add(task)
+    db.flush()
+    reset_request.task_id = task.id
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Created",
+        current_user=user,
+        new_status="Pending",
+        notes=reset_request.reason,
+        details={"password_reset_request_id": reset_request.id, "reset_2fa": reset_request.reset_2fa},
+    )
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Request Password Reset",
+        current_user=user,
+        entity_type="PasswordResetRequest",
+        entity_id=reset_request.id,
+        entity_label=reset_request.request_number,
+        remarks="Password reset requested",
+        request_path="/auth/forgot-password",
+        details={"username": user.username, "reset_2fa": reset_request.reset_2fa, "task_id": task.id},
+    )
+    db.commit()
+    return {"message": "If the account exists, a reset request has been submitted"}
+
+
+@app.post("/auth/2fa/setup/start")
+def start_2fa_setup(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Own Security Settings", db)
+    secret = pyotp.random_base32()
+    current_user.totp_secret_encrypted = encrypt_security_value(secret)
+    current_user.totp_enabled = "No"
+    current_user.updated_at = datetime.now()
+
+    totp = pyotp.TOTP(secret)
+    provisioning_uri = totp.provisioning_uri(
+        name=current_user.username,
+        issuer_name="Hydrocarbon Accounting System",
+    )
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Start 2FA Setup",
+        current_user=current_user,
+        entity_type="User",
+        entity_id=current_user.id,
+        entity_label=f"{current_user.full_name} ({current_user.username})",
+        remarks="2FA setup started",
+        request_path="/auth/2fa/setup/start",
+        details={"totp_enabled": False},
+    )
+    db.commit()
+    return {
+        "message": "2FA setup started",
+        "secret": secret,
+        "provisioning_uri": provisioning_uri,
+        "qr_code_data_url": build_totp_qr_data_url(provisioning_uri),
+    }
+
+
+@app.post("/auth/2fa/setup/verify")
+def verify_2fa_setup(
+    payload: TwoFASetupVerifyRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Own Security Settings", db)
+    secret = decrypt_security_value(current_user.totp_secret_encrypted)
+    if not secret:
+        raise HTTPException(status_code=400, detail="2FA setup has not been started")
+    normalized = "".join(ch for ch in str(payload.code or "").strip() if ch.isdigit())
+    if len(normalized) != 6 or not pyotp.TOTP(secret).verify(normalized, valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid authentication code")
+
+    backup_codes = generate_backup_codes()
+    current_user.totp_enabled = "Yes"
+    current_user.totp_confirmed_at = datetime.utcnow()
+    current_user.backup_codes_hash_json = hash_backup_codes(backup_codes)
+    current_user.updated_at = datetime.now()
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Enable 2FA",
+        current_user=current_user,
+        entity_type="User",
+        entity_id=current_user.id,
+        entity_label=f"{current_user.full_name} ({current_user.username})",
+        remarks="2FA enabled",
+        request_path="/auth/2fa/setup/verify",
+        details={"backup_code_count": len(backup_codes)},
+    )
+    db.commit()
+    return {"message": "2FA enabled successfully", "backup_codes": backup_codes}
+
+
+@app.post("/auth/2fa/backup-codes/regenerate")
+def regenerate_2fa_backup_codes(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Own Security Settings", db)
+    if normalize_yes_no(current_user.totp_enabled) != "Yes":
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+    backup_codes = generate_backup_codes()
+    current_user.backup_codes_hash_json = hash_backup_codes(backup_codes)
+    current_user.updated_at = datetime.now()
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Regenerate 2FA Backup Codes",
+        current_user=current_user,
+        entity_type="User",
+        entity_id=current_user.id,
+        entity_label=f"{current_user.full_name} ({current_user.username})",
+        remarks="2FA backup codes regenerated",
+        request_path="/auth/2fa/backup-codes/regenerate",
+        details={"backup_code_count": len(backup_codes)},
+    )
+    db.commit()
+    return {"message": "Backup codes regenerated", "backup_codes": backup_codes}
+
+
+@app.post("/auth/2fa/disable")
+def disable_own_2fa(
+    payload: TwoFADisableRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Own Security Settings", db)
+    if normalize_yes_no(current_user.force_2fa) == "Yes":
+        raise HTTPException(status_code=400, detail="2FA is mandatory for this account")
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if not verify_totp_or_backup_code(current_user, payload.code):
+        raise HTTPException(status_code=400, detail="Invalid authentication code")
+    current_user.totp_enabled = "No"
+    current_user.totp_secret_encrypted = None
+    current_user.totp_confirmed_at = None
+    current_user.backup_codes_hash_json = None
+    current_user.updated_at = datetime.now()
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Disable 2FA",
+        current_user=current_user,
+        entity_type="User",
+        entity_id=current_user.id,
+        entity_label=f"{current_user.full_name} ({current_user.username})",
+        remarks="2FA disabled",
+        request_path="/auth/2fa/disable",
+        details={"totp_enabled": False},
+    )
+    db.commit()
+    return {"message": "2FA disabled successfully"}
+
+
+@app.post("/users/{user_id}/security/reset-password")
+def admin_reset_user_password(
+    user_id: int,
+    payload: AdminResetPasswordRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Reset User Password", db)
+    if payload.reset_2fa:
+        require_user_permission(current_user, "Reset User 2FA", db)
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    validate_password_policy(payload.new_password)
+    target.password_hash = hash_password(payload.new_password)
+    target.password_changed_at = datetime.utcnow()
+    target.force_password_change = "Yes" if payload.force_password_change else "No"
+    target.failed_login_count = 0
+    target.locked_until = None
+    if payload.reset_2fa:
+        target.totp_enabled = "No"
+        target.totp_secret_encrypted = None
+        target.totp_confirmed_at = None
+        target.backup_codes_hash_json = None
+    target.updated_at = datetime.now()
+    create_audit_log(
+        db=db,
+        module_name="User Security",
+        action="Admin Reset User Password",
+        current_user=current_user,
+        entity_type="User",
+        entity_id=target.id,
+        entity_label=f"{target.full_name} ({target.username})",
+        remarks=payload.remarks or "Password reset by administrator",
+        request_path=f"/users/{user_id}/security/reset-password",
+        details={
+            "target_username": target.username,
+            "force_password_change": target.force_password_change,
+            "reset_2fa": payload.reset_2fa,
+        },
+    )
+
+    pending_requests = (
+        db.query(PasswordResetRequest)
+        .filter(
+            PasswordResetRequest.user_id == target.id,
+            PasswordResetRequest.status == "Pending",
+        )
+        .all()
+    )
+    for reset_request in pending_requests:
+        reset_request.status = "Completed"
+        reset_request.acted_by_user_id = current_user.id
+        reset_request.acted_at = datetime.utcnow()
+        reset_request.action_notes = payload.remarks or "Password reset completed by administrator"
+        if reset_request.task_id:
+            task = db.query(OperationTask).filter(OperationTask.id == reset_request.task_id).first()
+            if task and task.status in ["Pending", "In Progress"]:
+                old_status = task.status
+                task.status = "Closed"
+                task.acted_by_user_id = current_user.id
+                task.acted_at = datetime.now()
+                task.action_taken = "Password Reset Completed"
+                task.remarks = reset_request.action_notes
+                task.updated_at = datetime.now()
+                add_operation_task_event(
+                    db=db,
+                    task=task,
+                    event_type="Password Reset Completed",
+                    current_user=current_user,
+                    old_status=old_status,
+                    new_status=task.status,
+                    notes=task.remarks,
+                    details={"password_reset_request_id": reset_request.id},
+                )
+                create_audit_log(
+                    db=db,
+                    module_name="Operation Task",
+                    action="Close Password Reset Task",
+                    current_user=current_user,
+                    entity_type="OperationTask",
+                    entity_id=task.id,
+                    entity_label=task.task_number,
+                    old_status=old_status,
+                    new_status=task.status,
+                    remarks=task.remarks,
+                    request_path=f"/users/{user_id}/security/reset-password",
+                    details={"password_reset_request_id": reset_request.id, "target_user_id": target.id},
+                )
+    db.commit()
+    return {"message": "Password reset successfully"}
 
 
 class DevResetPasswordRequest(BaseModel):
@@ -1093,6 +2249,10 @@ def dev_reset_password(
     }
 
     user.password_hash = hash_password(reset_request.new_password)
+    user.password_changed_at = datetime.utcnow()
+    user.force_password_change = "Yes"
+    user.failed_login_count = 0
+    user.locked_until = None
     db.flush()
 
     create_audit_log(
@@ -1176,6 +2336,7 @@ def create_user(
         department=clean_optional_text(user.department),
         designation=clean_optional_text(user.designation),
         password_hash=hash_password(user.password),
+        password_changed_at=datetime.utcnow(),
         status=user.status,
     )
 
@@ -1272,6 +2433,8 @@ def update_user(
 
     if user.password is not None and user.password.strip() != "":
         existing_user.password_hash = hash_password(user.password)
+        existing_user.password_changed_at = datetime.utcnow()
+        existing_user.force_password_change = "Yes"
         password_changed = True
 
     after_data = {
@@ -2107,6 +3270,11 @@ def seed_standard_permissions(
             "description": "Can submit draft operation tickets",
         },
         {
+            "permission_name": "Review Operation Transaction",
+            "module_name": "Operations",
+            "description": "Can review operation tickets before submit/approve confirmation",
+        },
+        {
             "permission_name": "Approve Operation Transaction",
             "module_name": "Operations",
             "description": "Can approve submitted operation tickets",
@@ -2212,6 +3380,56 @@ def seed_standard_permissions(
             "permission_name": "Manage Material Balance Template",
             "module_name": "Configuration",
             "description": "Can create, edit, and delete Material Balance template configuration",
+        },
+        {
+            "permission_name": "View Operation Workflow Policy",
+            "module_name": "Operations",
+            "description": "Can view operation workflow authorization policies",
+        },
+        {
+            "permission_name": "Manage Operation Workflow Policy",
+            "module_name": "Operations",
+            "description": "Can create, update, and delete operation workflow authorization policies",
+        },
+        {
+            "permission_name": "View My Tasks",
+            "module_name": "Operations",
+            "description": "Can view assigned operation approval tasks",
+        },
+        {
+            "permission_name": "Act On Operation Task",
+            "module_name": "Operations",
+            "description": "Can take, release, approve, or reject assigned operation tasks",
+        },
+        {
+            "permission_name": "Manage Operation Tasks",
+            "module_name": "Operations",
+            "description": "Can view and manage all operation approval tasks",
+        },
+        {
+            "permission_name": "View Own Security Settings",
+            "module_name": "User Security",
+            "description": "Can view own password and 2FA security settings",
+        },
+        {
+            "permission_name": "Manage Own Security Settings",
+            "module_name": "User Security",
+            "description": "Can change own password and manage own 2FA settings",
+        },
+        {
+            "permission_name": "Request Password Reset",
+            "module_name": "User Security",
+            "description": "Can request administrator password reset",
+        },
+        {
+            "permission_name": "Reset User Password",
+            "module_name": "User Security",
+            "description": "Can hard reset user passwords",
+        },
+        {
+            "permission_name": "Reset User 2FA",
+            "module_name": "User Security",
+            "description": "Can reset user 2FA during administrator password reset",
         },
     ]
 
@@ -2723,6 +3941,268 @@ def delete_user_role(
 
     return {
         "message": "User role assignment deleted successfully"
+    }
+
+# -------------------------
+# Operation Workflow Policy APIs
+# -------------------------
+
+def build_operation_workflow_policy_response(policy: OperationWorkflowPolicy, db: Session):
+    role_rows = (
+        db.query(OperationWorkflowPolicyRole, Role)
+        .join(Role, Role.id == OperationWorkflowPolicyRole.role_id)
+        .filter(OperationWorkflowPolicyRole.policy_id == policy.id)
+        .all()
+    )
+    user_rows = (
+        db.query(OperationWorkflowPolicyUser, User)
+        .join(User, User.id == OperationWorkflowPolicyUser.user_id)
+        .filter(OperationWorkflowPolicyUser.policy_id == policy.id)
+        .all()
+    )
+    return {
+        "id": policy.id,
+        "policy_name": policy.policy_name,
+        "action_code": policy.action_code,
+        "operation_type_code": policy.operation_type_code,
+        "operation_template_id": policy.operation_template_id,
+        "asset_type_code": policy.asset_type_code,
+        "location_code": policy.location_code,
+        "priority": policy.priority,
+        "status": policy.status,
+        "roles": [
+            {"role_id": r.id, "role_name": r.role_name}
+            for _, r in role_rows
+        ],
+        "users": [
+            {
+                "user_id": u.id,
+                "username": u.username,
+                "full_name": u.full_name,
+                "mode": policy_user.mode,
+            }
+            for policy_user, u in user_rows
+        ],
+        "created_at": policy.created_at,
+        "updated_at": policy.updated_at,
+    }
+
+
+@app.get("/operation-workflow-policies", response_model=list[OperationWorkflowPolicyResponse])
+def get_operation_workflow_policies(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Workflow Policy", db)
+    rows = db.query(OperationWorkflowPolicy).order_by(
+        OperationWorkflowPolicy.priority.asc(),
+        OperationWorkflowPolicy.id.asc(),
+    ).all()
+    return [build_operation_workflow_policy_response(row, db) for row in rows]
+
+
+@app.post("/operation-workflow-policies", response_model=OperationWorkflowPolicyResponse)
+def create_operation_workflow_policy(
+    payload: OperationWorkflowPolicyCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Workflow Policy", db)
+    policy = OperationWorkflowPolicy(
+        policy_name=str(payload.policy_name or "").strip(),
+        action_code=str(payload.action_code or "").strip().upper(),
+        operation_type_code=clean_optional_text(payload.operation_type_code),
+        operation_template_id=payload.operation_template_id,
+        asset_type_code=clean_optional_text(payload.asset_type_code),
+        location_code=clean_optional_text(payload.location_code),
+        priority=payload.priority or 100,
+        status=payload.status or "Active",
+    )
+    if policy.policy_name == "" or policy.action_code == "":
+        raise HTTPException(status_code=400, detail="policy_name and action_code are required")
+    db.add(policy)
+    db.flush()
+
+    for role_id in sorted(set(payload.role_ids or [])):
+        role = db.query(Role).filter(Role.id == role_id).first()
+        if role:
+            db.add(OperationWorkflowPolicyRole(policy_id=policy.id, role_id=role.id))
+
+    for item in payload.users or []:
+        user = db.query(User).filter(User.id == item.user_id).first()
+        if user:
+            db.add(
+                OperationWorkflowPolicyUser(
+                    policy_id=policy.id,
+                    user_id=user.id,
+                    mode=str(item.mode or "ALLOW").upper(),
+                )
+            )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Workflow Policy",
+        action="Create Operation Workflow Policy",
+        current_user=current_user,
+        entity_type="OperationWorkflowPolicy",
+        entity_id=policy.id,
+        entity_label=policy.policy_name,
+        remarks="Workflow policy created",
+        request_path="/operation-workflow-policies",
+        details={"action_code": policy.action_code, "priority": policy.priority, "status": policy.status},
+    )
+    db.commit()
+    db.refresh(policy)
+    return build_operation_workflow_policy_response(policy, db)
+
+
+@app.put("/operation-workflow-policies/{policy_id}", response_model=OperationWorkflowPolicyResponse)
+def update_operation_workflow_policy(
+    policy_id: int,
+    payload: OperationWorkflowPolicyUpdate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Workflow Policy", db)
+    policy = db.query(OperationWorkflowPolicy).filter(OperationWorkflowPolicy.id == policy_id).first()
+    if not policy:
+        raise HTTPException(status_code=404, detail="Workflow policy not found")
+    before = build_operation_workflow_policy_response(policy, db)
+
+    if payload.policy_name is not None:
+        policy.policy_name = str(payload.policy_name).strip()
+    if payload.action_code is not None:
+        policy.action_code = str(payload.action_code).strip().upper()
+    if payload.operation_type_code is not None:
+        policy.operation_type_code = clean_optional_text(payload.operation_type_code)
+    if payload.operation_template_id is not None:
+        policy.operation_template_id = payload.operation_template_id
+    if payload.asset_type_code is not None:
+        policy.asset_type_code = clean_optional_text(payload.asset_type_code)
+    if payload.location_code is not None:
+        policy.location_code = clean_optional_text(payload.location_code)
+    if payload.priority is not None:
+        policy.priority = payload.priority
+    if payload.status is not None:
+        policy.status = payload.status
+    policy.updated_at = datetime.now()
+
+    after = build_operation_workflow_policy_response(policy, db)
+    create_audit_log(
+        db=db,
+        module_name="Operation Workflow Policy",
+        action="Update Operation Workflow Policy",
+        current_user=current_user,
+        entity_type="OperationWorkflowPolicy",
+        entity_id=policy.id,
+        entity_label=policy.policy_name,
+        remarks="Workflow policy updated",
+        request_path=f"/operation-workflow-policies/{policy_id}",
+        details={"before": before, "after": after},
+    )
+    db.commit()
+    db.refresh(policy)
+    return build_operation_workflow_policy_response(policy, db)
+
+
+@app.post("/operation-workflow-policies/{policy_id}/roles", response_model=OperationWorkflowPolicyResponse)
+def save_operation_workflow_policy_roles(
+    policy_id: int,
+    payload: OperationWorkflowPolicyRoleAssignRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Workflow Policy", db)
+    policy = db.query(OperationWorkflowPolicy).filter(OperationWorkflowPolicy.id == policy_id).first()
+    if not policy:
+        raise HTTPException(status_code=404, detail="Workflow policy not found")
+    db.query(OperationWorkflowPolicyRole).filter(OperationWorkflowPolicyRole.policy_id == policy_id).delete()
+    for role_id in sorted(set(payload.role_ids or [])):
+        role = db.query(Role).filter(Role.id == role_id).first()
+        if role:
+            db.add(OperationWorkflowPolicyRole(policy_id=policy_id, role_id=role.id))
+    db.commit()
+    db.refresh(policy)
+    return build_operation_workflow_policy_response(policy, db)
+
+
+@app.post("/operation-workflow-policies/{policy_id}/users", response_model=OperationWorkflowPolicyResponse)
+def save_operation_workflow_policy_users(
+    policy_id: int,
+    payload: OperationWorkflowPolicyUserAssignRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Workflow Policy", db)
+    policy = db.query(OperationWorkflowPolicy).filter(OperationWorkflowPolicy.id == policy_id).first()
+    if not policy:
+        raise HTTPException(status_code=404, detail="Workflow policy not found")
+    db.query(OperationWorkflowPolicyUser).filter(OperationWorkflowPolicyUser.policy_id == policy_id).delete()
+    for item in payload.users or []:
+        user = db.query(User).filter(User.id == item.user_id).first()
+        if user:
+            db.add(
+                OperationWorkflowPolicyUser(
+                    policy_id=policy_id,
+                    user_id=user.id,
+                    mode=str(item.mode or "ALLOW").upper(),
+                )
+            )
+    db.commit()
+    db.refresh(policy)
+    return build_operation_workflow_policy_response(policy, db)
+
+
+@app.delete("/operation-workflow-policies/{policy_id}")
+def delete_operation_workflow_policy(
+    policy_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Workflow Policy", db)
+    policy = db.query(OperationWorkflowPolicy).filter(OperationWorkflowPolicy.id == policy_id).first()
+    if not policy:
+        raise HTTPException(status_code=404, detail="Workflow policy not found")
+    create_audit_log(
+        db=db,
+        module_name="Operation Workflow Policy",
+        action="Delete Operation Workflow Policy",
+        current_user=current_user,
+        entity_type="OperationWorkflowPolicy",
+        entity_id=policy.id,
+        entity_label=policy.policy_name,
+        remarks="Workflow policy deleted",
+        request_path=f"/operation-workflow-policies/{policy_id}",
+        details={"policy_name": policy.policy_name, "action_code": policy.action_code},
+    )
+    db.delete(policy)
+    db.commit()
+    return {"message": "Workflow policy deleted successfully"}
+
+
+@app.post("/operation-workflow-policies/check", response_model=OperationWorkflowPolicyCheckResponse)
+def check_operation_workflow_policy(
+    payload: OperationWorkflowPolicyCheckRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Workflow Policy", db)
+    allowed, reason, matched = evaluate_operation_workflow_policy(
+        db=db,
+        current_user=current_user,
+        action_code=str(payload.action_code or "").upper(),
+        operation_type_code=clean_optional_text(payload.operation_type_code),
+        operation_template_id=payload.operation_template_id,
+        asset_type_code=clean_optional_text(payload.asset_type_code),
+        location_code=clean_optional_text(payload.location_code),
+    )
+    if allowed is None:
+        return {"allowed": True, "reason": "No policy matched; fallback to legacy permission map"}
+    return {
+        "allowed": bool(allowed),
+        "reason": reason,
+        "matched_policy_id": matched.id if matched else None,
+        "matched_policy_name": matched.policy_name if matched else None,
     }
 
 # -------------------------
@@ -10407,6 +11887,7 @@ def build_operation_transaction_response(
     return {
         "id": transaction.id,
         "operation_number": transaction.operation_number,
+        "operation_template_id": transaction.operation_template_id,
         "operation_ticket_number": get_transaction_ticket_number(transaction),
         "ticket_number": get_transaction_ticket_number(transaction),
         "operation_type_code": transaction.operation_type_code,
@@ -12202,6 +13683,421 @@ def delete_operation_template(
 
     return {"message": "Operation template deleted successfully"}
 
+
+def build_operation_template_layout_response(layout: OperationTemplateLayout, db: Session):
+    sections = (
+        db.query(OperationTemplateLayoutSection)
+        .filter(OperationTemplateLayoutSection.layout_id == layout.id)
+        .order_by(OperationTemplateLayoutSection.sort_order.asc(), OperationTemplateLayoutSection.id.asc())
+        .all()
+    )
+    items = (
+        db.query(OperationTemplateLayoutItem)
+        .filter(OperationTemplateLayoutItem.layout_id == layout.id)
+        .order_by(
+            OperationTemplateLayoutItem.row_no.asc(),
+            OperationTemplateLayoutItem.col_start.asc(),
+            OperationTemplateLayoutItem.sort_order.asc(),
+            OperationTemplateLayoutItem.id.asc(),
+        )
+        .all()
+    )
+
+    return {
+        "id": layout.id,
+        "template_id": layout.template_id,
+        "layout_name": layout.layout_name,
+        "version_no": layout.version_no,
+        "status": layout.status,
+        "is_default": layout.is_default,
+        "created_at": layout.created_at,
+        "updated_at": layout.updated_at,
+        "sections": [
+            {
+                "id": s.id,
+                "layout_id": s.layout_id,
+                "section_key": s.section_key,
+                "title": s.title,
+                "sort_order": s.sort_order,
+                "collapsible": s.collapsible,
+                "default_open": s.default_open,
+                "visibility_rule_json": s.visibility_rule_json,
+            }
+            for s in sections
+        ],
+        "items": [
+            {
+                "id": i.id,
+                "layout_id": i.layout_id,
+                "section_id": i.section_id,
+                "field_id": i.field_id,
+                "row_no": i.row_no,
+                "col_start": i.col_start,
+                "col_span": i.col_span,
+                "sort_order": i.sort_order,
+                "label_override": i.label_override,
+                "placeholder_override": i.placeholder_override,
+                "read_only_override": i.read_only_override,
+                "width_mode": i.width_mode,
+                "rule_json": i.rule_json,
+            }
+            for i in items
+        ],
+    }
+
+
+def validate_operation_template_layout_payload(payload_sections, payload_items):
+    sections = payload_sections or []
+    items = payload_items or []
+
+    if len(sections) == 0:
+        raise HTTPException(status_code=400, detail="At least one layout section is required")
+
+    cleaned_section_keys = []
+    for section in sections:
+        section_key = str(section.section_key or "").strip().lower()
+        if section_key == "":
+            raise HTTPException(status_code=400, detail="section_key cannot be blank")
+        cleaned_section_keys.append(section_key)
+
+    if len(set(cleaned_section_keys)) != len(cleaned_section_keys):
+        raise HTTPException(status_code=400, detail="Duplicate section_key found in layout sections")
+
+    used_field_ids = []
+    occupied_cells = set()
+    for item in items:
+        field_id = int(item.field_id or 0)
+        row_no = int(item.row_no or 1)
+        col_start = int(item.col_start or 1)
+        col_span = int(item.col_span or 1)
+
+        if field_id <= 0:
+            raise HTTPException(status_code=400, detail="Invalid field_id in layout item")
+        if row_no <= 0:
+            raise HTTPException(status_code=400, detail="row_no must be greater than 0")
+        if col_start <= 0:
+            raise HTTPException(status_code=400, detail="col_start must be greater than 0")
+        if col_span <= 0:
+            raise HTTPException(status_code=400, detail="col_span must be greater than 0")
+        if (col_start + col_span - 1) > 3:
+            raise HTTPException(status_code=400, detail="Layout grid allows max 3 columns per row")
+
+        used_field_ids.append(field_id)
+
+        for column in range(col_start, col_start + col_span):
+            key = (int(item.section_id or 0), row_no, column)
+            if key in occupied_cells:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Overlapping layout cells detected in the same section/row/column",
+                )
+            occupied_cells.add(key)
+
+    if len(set(used_field_ids)) != len(used_field_ids):
+        raise HTTPException(status_code=400, detail="Each template field can be placed only once in a layout")
+
+
+@app.get(
+    "/operation-templates/{template_id}/layouts",
+    response_model=list[OperationTemplateLayoutResponse],
+)
+def get_operation_template_layouts(
+    template_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Template", db)
+
+    template = db.query(OperationTemplate).filter(OperationTemplate.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Operation template not found")
+
+    layouts = (
+        db.query(OperationTemplateLayout)
+        .filter(OperationTemplateLayout.template_id == template_id)
+        .order_by(OperationTemplateLayout.version_no.desc(), OperationTemplateLayout.id.desc())
+        .all()
+    )
+    return [build_operation_template_layout_response(layout, db) for layout in layouts]
+
+
+@app.post(
+    "/operation-templates/{template_id}/layouts",
+    response_model=OperationTemplateLayoutResponse,
+)
+def create_operation_template_layout(
+    template_id: int,
+    payload: OperationTemplateLayoutCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Template", db)
+
+    template = db.query(OperationTemplate).filter(OperationTemplate.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Operation template not found")
+
+    if str(payload.layout_name or "").strip() == "":
+        raise HTTPException(status_code=400, detail="layout_name is required")
+    validate_operation_template_layout_payload(payload.sections, payload.items)
+    if (payload.is_default or "No") == "Yes" and (payload.status or "Draft") != "Active":
+        raise HTTPException(status_code=400, detail="Default layout must be in Active status")
+
+    existing = (
+        db.query(OperationTemplateLayout)
+        .filter(
+            OperationTemplateLayout.template_id == template_id,
+            OperationTemplateLayout.layout_name.ilike(payload.layout_name.strip()),
+            OperationTemplateLayout.version_no == payload.version_no,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Layout version already exists for this template")
+
+    layout = OperationTemplateLayout(
+        template_id=template_id,
+        layout_name=payload.layout_name.strip(),
+        version_no=payload.version_no or 1,
+        status=payload.status or "Draft",
+        is_default=payload.is_default or "No",
+    )
+    db.add(layout)
+    db.flush()
+
+    if layout.is_default == "Yes":
+        db.query(OperationTemplateLayout).filter(
+            OperationTemplateLayout.template_id == template_id,
+            OperationTemplateLayout.id != layout.id,
+        ).update({"is_default": "No"}, synchronize_session=False)
+
+    for index, section in enumerate(payload.sections or []):
+        db.add(
+            OperationTemplateLayoutSection(
+                layout_id=layout.id,
+                section_key=str(section.section_key or "").strip(),
+                title=str(section.title or "").strip(),
+                sort_order=section.sort_order or index + 1,
+                collapsible=section.collapsible or "No",
+                default_open=section.default_open or "Yes",
+                visibility_rule_json=section.visibility_rule_json,
+            )
+        )
+
+    db.flush()
+
+    sections_in_layout = (
+        db.query(OperationTemplateLayoutSection)
+        .filter(OperationTemplateLayoutSection.layout_id == layout.id)
+        .order_by(OperationTemplateLayoutSection.sort_order.asc(), OperationTemplateLayoutSection.id.asc())
+        .all()
+    )
+    section_ids = {s.id for s in sections_in_layout}
+    section_id_by_position = {index + 1: section.id for index, section in enumerate(sections_in_layout)}
+    template_field_ids = {
+        f.id
+        for f in db.query(OperationTemplateField).filter(
+            OperationTemplateField.template_id == template_id
+        ).all()
+    }
+
+    for index, item in enumerate(payload.items or []):
+        resolved_section_id = item.section_id
+        if resolved_section_id not in section_ids:
+            resolved_section_id = section_id_by_position.get(item.section_id)
+        if resolved_section_id not in section_ids:
+            raise HTTPException(status_code=400, detail=f"Invalid section_id for layout: {item.section_id}")
+        if item.field_id not in template_field_ids:
+            raise HTTPException(status_code=400, detail=f"field_id does not belong to template: {item.field_id}")
+        db.add(
+            OperationTemplateLayoutItem(
+                layout_id=layout.id,
+                section_id=resolved_section_id,
+                field_id=item.field_id,
+                row_no=item.row_no or 1,
+                col_start=item.col_start or 1,
+                col_span=item.col_span or 1,
+                sort_order=item.sort_order or index + 1,
+                label_override=clean_optional_text(item.label_override),
+                placeholder_override=clean_optional_text(item.placeholder_override),
+                read_only_override=clean_optional_text(item.read_only_override),
+                width_mode=clean_optional_text(item.width_mode),
+                rule_json=item.rule_json,
+            )
+        )
+
+    db.flush()
+
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Create Operation Template Layout",
+        current_user=current_user,
+        entity_type="OperationTemplateLayout",
+        entity_id=layout.id,
+        entity_label=f"{template.template_name} / {layout.layout_name} v{layout.version_no}",
+        remarks="Operation template layout created",
+        request_path=f"/operation-templates/{template_id}/layouts",
+        details={
+            "template_id": template_id,
+            "layout_name": layout.layout_name,
+            "version_no": layout.version_no,
+            "status": layout.status,
+            "is_default": layout.is_default,
+            "section_count": len(payload.sections or []),
+            "item_count": len(payload.items or []),
+        },
+    )
+
+    db.commit()
+    db.refresh(layout)
+    return build_operation_template_layout_response(layout, db)
+
+
+@app.get(
+    "/operation-template-layouts/{layout_id}",
+    response_model=OperationTemplateLayoutResponse,
+)
+def get_operation_template_layout(
+    layout_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Template", db)
+
+    layout = db.query(OperationTemplateLayout).filter(OperationTemplateLayout.id == layout_id).first()
+    if not layout:
+        raise HTTPException(status_code=404, detail="Operation template layout not found")
+
+    return build_operation_template_layout_response(layout, db)
+
+
+@app.put(
+    "/operation-template-layouts/{layout_id}",
+    response_model=OperationTemplateLayoutResponse,
+)
+def update_operation_template_layout(
+    layout_id: int,
+    payload: OperationTemplateLayoutUpdate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Template", db)
+
+    layout = db.query(OperationTemplateLayout).filter(OperationTemplateLayout.id == layout_id).first()
+    if not layout:
+        raise HTTPException(status_code=404, detail="Operation template layout not found")
+
+    before_data = build_operation_template_layout_response(layout, db)
+
+    if payload.layout_name is not None:
+        name = payload.layout_name.strip()
+        if name == "":
+            raise HTTPException(status_code=400, detail="layout_name cannot be blank")
+        layout.layout_name = name
+    if payload.status is not None:
+        layout.status = payload.status
+    if payload.is_default is not None:
+        layout.is_default = payload.is_default
+    if layout.is_default == "Yes" and layout.status != "Active":
+        raise HTTPException(status_code=400, detail="Default layout must be in Active status")
+    if payload.sections is not None or payload.items is not None:
+        if payload.sections is None or payload.items is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Both sections and items must be provided together when updating layout structure",
+            )
+        validate_operation_template_layout_payload(payload.sections, payload.items)
+
+    if payload.sections is not None:
+        db.query(OperationTemplateLayoutSection).filter(
+            OperationTemplateLayoutSection.layout_id == layout_id
+        ).delete()
+        for index, section in enumerate(payload.sections):
+            db.add(
+                OperationTemplateLayoutSection(
+                    layout_id=layout_id,
+                    section_key=str(section.section_key or "").strip(),
+                    title=str(section.title or "").strip(),
+                    sort_order=section.sort_order or index + 1,
+                    collapsible=section.collapsible or "No",
+                    default_open=section.default_open or "Yes",
+                    visibility_rule_json=section.visibility_rule_json,
+                )
+            )
+        db.flush()
+
+    if payload.items is not None:
+        sections_in_layout = (
+            db.query(OperationTemplateLayoutSection)
+            .filter(OperationTemplateLayoutSection.layout_id == layout_id)
+            .order_by(OperationTemplateLayoutSection.sort_order.asc(), OperationTemplateLayoutSection.id.asc())
+            .all()
+        )
+        section_ids = {s.id for s in sections_in_layout}
+        section_id_by_position = {index + 1: section.id for index, section in enumerate(sections_in_layout)}
+        template_field_ids = {
+            f.id
+            for f in db.query(OperationTemplateField).filter(
+                OperationTemplateField.template_id == layout.template_id
+            ).all()
+        }
+
+        db.query(OperationTemplateLayoutItem).filter(
+            OperationTemplateLayoutItem.layout_id == layout_id
+        ).delete()
+        for index, item in enumerate(payload.items):
+            resolved_section_id = item.section_id
+            if resolved_section_id not in section_ids:
+                resolved_section_id = section_id_by_position.get(item.section_id)
+            if resolved_section_id not in section_ids:
+                raise HTTPException(status_code=400, detail=f"Invalid section_id for layout: {item.section_id}")
+            if item.field_id not in template_field_ids:
+                raise HTTPException(status_code=400, detail=f"field_id does not belong to template: {item.field_id}")
+            db.add(
+                OperationTemplateLayoutItem(
+                    layout_id=layout_id,
+                    section_id=resolved_section_id,
+                    field_id=item.field_id,
+                    row_no=item.row_no or 1,
+                    col_start=item.col_start or 1,
+                    col_span=item.col_span or 1,
+                    sort_order=item.sort_order or index + 1,
+                    label_override=clean_optional_text(item.label_override),
+                    placeholder_override=clean_optional_text(item.placeholder_override),
+                    read_only_override=clean_optional_text(item.read_only_override),
+                    width_mode=clean_optional_text(item.width_mode),
+                    rule_json=item.rule_json,
+                )
+            )
+        db.flush()
+
+    if layout.is_default == "Yes":
+        db.query(OperationTemplateLayout).filter(
+            OperationTemplateLayout.template_id == layout.template_id,
+            OperationTemplateLayout.id != layout.id,
+        ).update({"is_default": "No"}, synchronize_session=False)
+
+    layout.updated_at = datetime.now()
+
+    after_data = build_operation_template_layout_response(layout, db)
+    create_audit_log(
+        db=db,
+        module_name="Operations",
+        action="Update Operation Template Layout",
+        current_user=current_user,
+        entity_type="OperationTemplateLayout",
+        entity_id=layout.id,
+        entity_label=f"Template {layout.template_id} / {layout.layout_name} v{layout.version_no}",
+        remarks="Operation template layout updated",
+        request_path=f"/operation-template-layouts/{layout_id}",
+        details={"before": before_data, "after": after_data},
+    )
+
+    db.commit()
+    db.refresh(layout)
+    return build_operation_template_layout_response(layout, db)
+
 # -------------------------
 # Operation Entry APIs
 # -------------------------
@@ -12565,6 +14461,18 @@ def create_operation_entry(
         value_map,
         transaction_operation_type_code,
     ) = validate_operation_entry(entry, db)
+
+    policy_allowed, policy_reason, _ = evaluate_operation_workflow_policy(
+        db=db,
+        current_user=current_user,
+        action_code="CREATE_ENTRY",
+        operation_type_code=clean_optional_text(transaction_operation_type_code),
+        operation_template_id=template.id,
+        asset_type_code=clean_optional_text(asset.asset_type_code),
+        location_code=clean_optional_text(entry.transaction.origin_location_code),
+    )
+    if policy_allowed is False:
+        raise HTTPException(status_code=403, detail=f"Workflow policy denied action: {policy_reason}")
 
     # ✅ Trip lock ONLY for barges (avoid blocking shuttle/tanker convoy numbers)
     trip = None
@@ -18341,6 +20249,362 @@ def auto_create_barge_tracking_on_approval(
 
     return trip, new_event, new_cmp
 
+# -------------------------
+# Operation Task APIs
+# -------------------------
+
+def build_operation_task_response(task: OperationTask, db: Session, include_transaction: bool = True):
+    transaction_payload = None
+    if include_transaction:
+        transaction = (
+            db.query(OperationTransaction)
+            .filter(OperationTransaction.id == task.transaction_id)
+            .first()
+        )
+        if transaction:
+            transaction_payload = build_operation_transaction_response(transaction, db)
+
+    return {
+        "id": task.id,
+        "task_number": task.task_number,
+        "task_type": task.task_type,
+        "transaction_id": task.transaction_id,
+        "ticket_number": task.ticket_number,
+        "operation_number": task.operation_number,
+        "operation_type_code": task.operation_type_code,
+        "operation_template_id": task.operation_template_id,
+        "asset_type_code": task.asset_type_code,
+        "primary_asset_code": task.primary_asset_code,
+        "location_code": task.location_code,
+        "raised_by_user_id": task.raised_by_user_id,
+        "assigned_policy_id": task.assigned_policy_id,
+        "assigned_role_ids_json": task.assigned_role_ids_json or [],
+        "assigned_user_ids_json": task.assigned_user_ids_json or [],
+        "status": task.status,
+        "priority": task.priority,
+        "due_at": task.due_at,
+        "taken_by_user_id": task.taken_by_user_id,
+        "taken_at": task.taken_at,
+        "acted_by_user_id": task.acted_by_user_id,
+        "acted_at": task.acted_at,
+        "action_taken": task.action_taken,
+        "remarks": task.remarks,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "transaction": transaction_payload,
+    }
+
+
+def parse_task_filter_date(value: str | None, field_label: str):
+    cleaned_value = clean_optional_text(value)
+
+    if not cleaned_value:
+        return None
+
+    try:
+        return date.fromisoformat(cleaned_value)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_label} must be in YYYY-MM-DD format",
+        )
+
+
+def apply_operation_task_filters(
+    query,
+    status: str | None,
+    task_type: str | None,
+    search: str | None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+):
+    cleaned_status = clean_optional_text(status)
+    cleaned_task_type = clean_optional_text(task_type)
+    cleaned_search = clean_optional_text(search)
+    from_date = parse_task_filter_date(created_from, "Created From")
+    to_date = parse_task_filter_date(created_to, "Created To")
+
+    if cleaned_status and cleaned_status != "ALL":
+        query = query.filter(OperationTask.status == cleaned_status)
+    if cleaned_task_type and cleaned_task_type != "ALL":
+        query = query.filter(OperationTask.task_type == cleaned_task_type)
+    if from_date:
+        query = query.filter(
+            OperationTask.created_at >= datetime.combine(from_date, datetime_time.min)
+        )
+    if to_date:
+        query = query.filter(
+            OperationTask.created_at <= datetime.combine(to_date, datetime_time.max)
+        )
+    if cleaned_search:
+        pattern = f"%{cleaned_search}%"
+        query = query.filter(
+            or_(
+                OperationTask.task_number.ilike(pattern),
+                OperationTask.ticket_number.ilike(pattern),
+                OperationTask.operation_number.ilike(pattern),
+                OperationTask.primary_asset_code.ilike(pattern),
+                OperationTask.location_code.ilike(pattern),
+            )
+        )
+    return query
+
+
+@app.get("/operation-tasks/my", response_model=list[OperationTaskResponse])
+def get_my_operation_tasks(
+    status: str | None = None,
+    task_type: str | None = None,
+    search: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View My Tasks", db)
+    query = db.query(OperationTask).order_by(OperationTask.created_at.desc(), OperationTask.id.desc())
+    query = apply_operation_task_filters(
+        query,
+        status,
+        task_type,
+        search,
+        created_from,
+        created_to,
+    )
+    tasks = query.all()
+    visible = [task for task in tasks if user_can_act_on_operation_task(db, current_user, task)]
+    return [build_operation_task_response(task, db) for task in visible]
+
+
+@app.get("/operation-tasks", response_model=list[OperationTaskResponse])
+def get_operation_tasks(
+    status: str | None = None,
+    task_type: str | None = None,
+    search: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage Operation Tasks", db)
+    query = db.query(OperationTask).order_by(OperationTask.created_at.desc(), OperationTask.id.desc())
+    query = apply_operation_task_filters(
+        query,
+        status,
+        task_type,
+        search,
+        created_from,
+        created_to,
+    )
+    return [build_operation_task_response(task, db) for task in query.all()]
+
+
+@app.get("/operation-tasks/{task_id}", response_model=OperationTaskResponse)
+def get_operation_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View My Tasks", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Operation task not found")
+    if not user_can_act_on_operation_task(db, current_user, task) and not user_has_permission(current_user, "Manage Operation Tasks", db):
+        raise HTTPException(status_code=403, detail="You are not assigned to this task")
+    return build_operation_task_response(task, db)
+
+
+@app.get("/operation-tasks/{task_id}/events", response_model=list[OperationTaskEventResponse])
+def get_operation_task_events(
+    task_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    get_operation_task(task_id, current_user, db)
+    events = (
+        db.query(OperationTaskEvent)
+        .filter(OperationTaskEvent.task_id == task_id)
+        .order_by(OperationTaskEvent.created_at.asc(), OperationTaskEvent.id.asc())
+        .all()
+    )
+    return events
+
+
+@app.post("/operation-tasks/{task_id}/take-ownership", response_model=OperationTaskResponse)
+def take_operation_task_ownership(
+    task_id: int,
+    payload: OperationTaskActionRequest | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Act On Operation Task", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Operation task not found")
+    if task.status not in ["Pending", "In Progress"]:
+        raise HTTPException(status_code=400, detail="Only open tasks can be taken")
+    if not user_can_act_on_operation_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="You are not assigned to this task")
+
+    old_status = task.status
+    task.status = "In Progress"
+    task.taken_by_user_id = current_user.id
+    task.taken_at = datetime.now()
+    task.updated_at = datetime.now()
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Taken",
+        current_user=current_user,
+        old_status=old_status,
+        new_status=task.status,
+        notes=payload.remarks if payload else None,
+    )
+    create_audit_log(
+        db=db,
+        module_name="Operation Task",
+        action="Take Operation Task Ownership",
+        current_user=current_user,
+        entity_type="OperationTask",
+        entity_id=task.id,
+        entity_label=task.task_number,
+        ticket_number=task.ticket_number,
+        operation_number=task.operation_number,
+        old_status=old_status,
+        new_status=task.status,
+        remarks=payload.remarks if payload else "",
+        request_path=f"/operation-tasks/{task_id}/take-ownership",
+        details={
+            "task_type": task.task_type,
+            "transaction_id": task.transaction_id,
+            "operation_type_code": task.operation_type_code,
+            "operation_template_id": task.operation_template_id,
+            "asset_type_code": task.asset_type_code,
+            "primary_asset_code": task.primary_asset_code,
+            "location_code": task.location_code,
+            "taken_by_user_id": current_user.id,
+        },
+    )
+    db.commit()
+    db.refresh(task)
+    return build_operation_task_response(task, db)
+
+
+@app.post("/operation-tasks/{task_id}/release", response_model=OperationTaskResponse)
+def release_operation_task(
+    task_id: int,
+    payload: OperationTaskActionRequest | None = None,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Act On Operation Task", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Operation task not found")
+    if task.status != "In Progress":
+        raise HTTPException(status_code=400, detail="Only In Progress tasks can be released")
+    if task.taken_by_user_id != current_user.id and not user_has_permission(current_user, "Manage Operation Tasks", db):
+        raise HTTPException(status_code=403, detail="Only the owner or task manager can release this task")
+
+    old_status = task.status
+    task.status = "Pending"
+    task.taken_by_user_id = None
+    task.taken_at = None
+    task.updated_at = datetime.now()
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Released",
+        current_user=current_user,
+        old_status=old_status,
+        new_status=task.status,
+        notes=payload.remarks if payload else None,
+    )
+    create_audit_log(
+        db=db,
+        module_name="Operation Task",
+        action="Release Operation Task",
+        current_user=current_user,
+        entity_type="OperationTask",
+        entity_id=task.id,
+        entity_label=task.task_number,
+        ticket_number=task.ticket_number,
+        operation_number=task.operation_number,
+        old_status=old_status,
+        new_status=task.status,
+        remarks=payload.remarks if payload else "",
+        request_path=f"/operation-tasks/{task_id}/release",
+        details={
+            "task_type": task.task_type,
+            "transaction_id": task.transaction_id,
+            "operation_type_code": task.operation_type_code,
+            "operation_template_id": task.operation_template_id,
+            "asset_type_code": task.asset_type_code,
+            "primary_asset_code": task.primary_asset_code,
+            "location_code": task.location_code,
+            "released_by_user_id": current_user.id,
+        },
+    )
+    db.commit()
+    db.refresh(task)
+    return build_operation_task_response(task, db)
+
+
+@app.post("/operation-tasks/{task_id}/approve")
+def approve_operation_task(
+    task_id: int,
+    payload: OperationTaskActionRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Act On Operation Task", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Operation task not found")
+    if task.status not in ["Pending", "In Progress"]:
+        raise HTTPException(status_code=400, detail="Only open tasks can be approved")
+    if not user_can_act_on_operation_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="You are not assigned to this task")
+
+    return update_operation_transaction_status(
+        transaction_id=task.transaction_id,
+        status_update=OperationTransactionStatusUpdate(
+            status="Approved",
+            remarks=payload.remarks,
+            review_confirmed=True,
+        ),
+        current_user=current_user,
+        db=db,
+    )
+
+
+@app.post("/operation-tasks/{task_id}/reject")
+def reject_operation_task(
+    task_id: int,
+    payload: OperationTaskActionRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Act On Operation Task", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Operation task not found")
+    if task.status not in ["Pending", "In Progress"]:
+        raise HTTPException(status_code=400, detail="Only open tasks can be rejected")
+    if not user_can_act_on_operation_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="You are not assigned to this task")
+
+    return update_operation_transaction_status(
+        transaction_id=task.transaction_id,
+        status_update=OperationTransactionStatusUpdate(
+            status="Rejected",
+            remarks=payload.remarks,
+            review_confirmed=False,
+        ),
+        current_user=current_user,
+        db=db,
+    )
+
+
 @app.patch("/operation-transactions/{transaction_id}/status")
 def update_operation_transaction_status(
     transaction_id: int,
@@ -18386,6 +20650,23 @@ def update_operation_transaction_status(
     if required_permission:
         require_user_permission(current_user, required_permission, db)
 
+    action_code = get_action_code_for_status_change(next_status)
+    if action_code:
+        policy_allowed, policy_reason, matched_policy = evaluate_operation_workflow_policy(
+            db=db,
+            current_user=current_user,
+            action_code=action_code,
+            operation_type_code=clean_optional_text(transaction.operation_type_code),
+            operation_template_id=transaction.operation_template_id,
+            asset_type_code=clean_optional_text(transaction.primary_asset_type_code),
+            location_code=clean_optional_text(transaction.origin_location_code),
+        )
+        if policy_allowed is False:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Workflow policy denied action: {policy_reason}",
+            )
+
     validate_operation_status_transition(transaction.status, next_status)
 
     old_status = transaction.status
@@ -18404,6 +20685,19 @@ def update_operation_transaction_status(
             status_code=400,
             detail="Review confirmation is required for Submit/Approve.",
         )
+    if review_confirmed:
+        require_user_permission(current_user, "Review Operation Transaction", db)
+        review_allowed, review_reason, _ = evaluate_operation_workflow_policy(
+            db=db,
+            current_user=current_user,
+            action_code="REVIEW",
+            operation_type_code=clean_optional_text(transaction.operation_type_code),
+            operation_template_id=transaction.operation_template_id,
+            asset_type_code=clean_optional_text(transaction.primary_asset_type_code),
+            location_code=clean_optional_text(transaction.origin_location_code),
+        )
+        if review_allowed is False:
+            raise HTTPException(status_code=403, detail=f"Workflow policy denied action: {review_reason}")
 
     seal_validation_details = None
     if next_status == "Submitted":
@@ -18478,6 +20772,69 @@ def update_operation_transaction_status(
 
     db.add(history)
 
+    if next_status == "Submitted":
+        task = create_operation_approval_task_for_transaction(
+            db=db,
+            transaction=transaction,
+            current_user=current_user,
+        )
+        create_audit_log(
+            db=db,
+            module_name="Operation Task",
+            action="Create Approval Task",
+            current_user=current_user,
+            entity_type="OperationTask",
+            entity_id=task.id,
+            entity_label=task.task_number,
+            ticket_number=get_transaction_ticket_number(transaction),
+            operation_number=transaction.operation_number,
+            new_status=task.status,
+            remarks="Approval task created on transaction submission",
+            request_path=f"/operation-transactions/{transaction_id}/status",
+            details={
+                "transaction_id": transaction.id,
+                "assigned_policy_id": task.assigned_policy_id,
+                "assigned_role_ids": task.assigned_role_ids_json,
+                "assigned_user_ids": task.assigned_user_ids_json,
+            },
+        )
+    elif next_status == "Approved":
+        close_operation_approval_tasks_for_transaction(
+            db=db,
+            transaction=transaction,
+            current_user=current_user,
+            task_status="Approved",
+            action_taken="Approved",
+            notes=status_remarks,
+        )
+    elif next_status == "Rejected":
+        close_operation_approval_tasks_for_transaction(
+            db=db,
+            transaction=transaction,
+            current_user=current_user,
+            task_status="Rejected",
+            action_taken="Rejected",
+            notes=status_remarks,
+        )
+    elif next_status == "Draft":
+        close_operation_approval_tasks_for_transaction(
+            db=db,
+            transaction=transaction,
+            current_user=current_user,
+            task_status="Cancelled",
+            action_taken="Recalled",
+            notes=status_remarks,
+        )
+    elif next_status == "Cancelled":
+        close_operation_approval_tasks_for_transaction(
+            db=db,
+            transaction=transaction,
+            current_user=current_user,
+            task_status="Cancelled",
+            action_taken="Cancelled",
+            notes=status_remarks,
+        )
+
     action_name = f"Change Status to {next_status}"
 
     if next_status == "Submitted":
@@ -18511,6 +20868,9 @@ def update_operation_transaction_status(
             "primary_asset_code": transaction.primary_asset_code,
             "origin_location_code": transaction.origin_location_code,
             "operation_date": str(transaction.operation_date),
+            "workflow_action_code": action_code,
+            "workflow_policy_id": matched_policy.id if 'matched_policy' in locals() and matched_policy else None,
+            "workflow_policy_name": matched_policy.policy_name if 'matched_policy' in locals() and matched_policy else None,
             "seal_validation": seal_validation_details,
             "review_confirmed": review_confirmed,
             "reviewed_by": changed_by if review_confirmed else None,
@@ -18619,6 +20979,18 @@ def update_operation_entry(
         value_map,
         transaction_operation_type_code,
     ) = validate_operation_entry(entry, db)
+
+    policy_allowed, policy_reason, _ = evaluate_operation_workflow_policy(
+        db=db,
+        current_user=current_user,
+        action_code="EDIT_DRAFT",
+        operation_type_code=clean_optional_text(transaction_operation_type_code),
+        operation_template_id=template.id,
+        asset_type_code=clean_optional_text(asset.asset_type_code),
+        location_code=clean_optional_text(entry.transaction.origin_location_code),
+    )
+    if policy_allowed is False:
+        raise HTTPException(status_code=403, detail=f"Workflow policy denied action: {policy_reason}")
 
     existing_transaction.operation_type_code = transaction_operation_type_code
     existing_transaction.operation_template_id = template.id
