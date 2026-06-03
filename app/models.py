@@ -904,6 +904,43 @@ class OperationTransaction(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now())
 
+
+class ApprovedTransactionCorrectionRequest(Base):
+    __tablename__ = "approved_transaction_correction_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_number = Column(String(80), nullable=False, unique=True, index=True)
+    transaction_id = Column(
+        Integer,
+        ForeignKey("operation_transactions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    task_id = Column(
+        Integer,
+        ForeignKey("operation_tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    ticket_number = Column(String(100), nullable=True, index=True)
+    operation_number = Column(String(80), nullable=True, index=True)
+    request_type = Column(String(80), nullable=False)
+    suggested_action = Column(String(80), nullable=False)
+    reason = Column(Text, nullable=False)
+    status = Column(String(50), nullable=False, default="Pending Admin Review", index=True)
+    requested_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    requested_by_display = Column(String(150), nullable=True)
+    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    admin_action = Column(String(80), nullable=True)
+    admin_remarks = Column(Text, nullable=True)
+    admin_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    admin_action_at = Column(DateTime, nullable=True)
+    previous_status_before_revoke = Column(String(50), nullable=True)
+    new_status_after_revoke = Column(String(50), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
 class MaterialBalanceTemplate(Base):
     __tablename__ = "material_balance_templates"
 

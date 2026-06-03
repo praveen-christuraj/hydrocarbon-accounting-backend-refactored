@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, date, time as datetime_time
+﻿from datetime import datetime, timedelta, date, time as datetime_time
 from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
@@ -88,6 +88,7 @@ from app.models import (
     OperationWorkflowPolicyUser,
     OperationTask,
     OperationTaskEvent,
+    ApprovedTransactionCorrectionRequest,
     Table11Factor,
     BargeSealMaster,
     FlowmeterConfig,
@@ -190,6 +191,9 @@ from app.schemas import (
     OperationTaskActionRequest,
     OperationTaskResponse,
     OperationTaskEventResponse,
+    ApprovedTransactionCorrectionRequestCreate,
+    ApprovedTransactionCorrectionAdminAction,
+    ApprovedTransactionCorrectionRequestResponse,
     UserUpdate,
     Table11FactorBulkCreate,
     Table11FactorCreate,
@@ -808,6 +812,200 @@ def create_operation_approval_task_for_transaction(
     return task
 
 
+def generate_correction_request_number(db: Session):
+    today = datetime.now().strftime("%Y%m%d")
+    prefix = f"CORR-{today}"
+    count = (
+        db.query(ApprovedTransactionCorrectionRequest)
+        .filter(ApprovedTransactionCorrectionRequest.request_number.ilike(f"{prefix}%"))
+        .count()
+    )
+    return f"{prefix}-{count + 1:04d}"
+
+
+def build_correction_request_response(row: ApprovedTransactionCorrectionRequest):
+    return {
+        "id": row.id,
+        "request_number": row.request_number,
+        "transaction_id": row.transaction_id,
+        "task_id": row.task_id,
+        "ticket_number": row.ticket_number,
+        "operation_number": row.operation_number,
+        "request_type": row.request_type,
+        "suggested_action": row.suggested_action,
+        "reason": row.reason,
+        "status": row.status,
+        "requested_by_user_id": row.requested_by_user_id,
+        "requested_by_display": row.requested_by_display,
+        "requested_at": row.requested_at,
+        "admin_action": row.admin_action,
+        "admin_remarks": row.admin_remarks,
+        "admin_user_id": row.admin_user_id,
+        "admin_action_at": row.admin_action_at,
+        "previous_status_before_revoke": row.previous_status_before_revoke,
+        "new_status_after_revoke": row.new_status_after_revoke,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def create_approved_transaction_revoke_task(
+    db: Session,
+    transaction: OperationTransaction,
+    correction_request: ApprovedTransactionCorrectionRequest,
+    current_user: User,
+):
+    assigned_role_ids = get_role_ids_with_permission(
+        db,
+        "Admin Revoke Approved Transaction",
+    )
+    if not assigned_role_ids:
+        assigned_role_ids = get_role_ids_with_permission(db, "Manage Operation Tasks")
+
+    task = OperationTask(
+        task_number=generate_operation_task_number(db),
+        task_type="APPROVED_TRANSACTION_REVOKE_REQUEST",
+        transaction_id=transaction.id,
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        operation_type_code=transaction.operation_type_code,
+        operation_template_id=transaction.operation_template_id,
+        asset_type_code=transaction.primary_asset_type_code,
+        primary_asset_code=transaction.primary_asset_code,
+        location_code=transaction.origin_location_code,
+        raised_by_user_id=current_user.id,
+        assigned_role_ids_json=assigned_role_ids,
+        assigned_user_ids_json=[],
+        status="Pending",
+        priority="High",
+        remarks=(
+            f"{correction_request.request_number}: "
+            f"{correction_request.request_type} / {correction_request.suggested_action}. "
+            f"{correction_request.reason}"
+        ),
+    )
+    db.add(task)
+    db.flush()
+
+    correction_request.task_id = task.id
+
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Created",
+        current_user=current_user,
+        new_status="Pending",
+        notes="Approved transaction correction request created",
+        details={
+            "correction_request_id": correction_request.id,
+            "request_number": correction_request.request_number,
+            "request_type": correction_request.request_type,
+            "suggested_action": correction_request.suggested_action,
+            "assigned_role_ids": assigned_role_ids,
+        },
+    )
+    return task
+
+
+def reverse_tank_stock_ledger_for_revoked_transaction(
+    db: Session,
+    transaction: OperationTransaction,
+):
+    rows = (
+        db.query(TankStockLedger)
+        .filter(
+            TankStockLedger.transaction_id == transaction.id,
+            TankStockLedger.status.in_(["Active", "Correction Hold"]),
+        )
+        .all()
+    )
+
+    group_keys = set()
+    for row in rows:
+        row.status = "Reversed"
+        row.updated_at = datetime.now()
+        group_keys.add((row.location_code, row.tank_asset_code, row.product_name))
+
+    for location_code, tank_asset_code, product_name in group_keys:
+        rebuild_tank_stock_running_balances(
+            db=db,
+            location_code=location_code,
+            tank_asset_code=tank_asset_code,
+            product_name=product_name,
+        )
+
+    return {
+        "reversed_rows": len(rows),
+        "groups_rebuilt": len(group_keys),
+    }
+
+
+def set_tank_stock_ledger_correction_hold(
+    db: Session,
+    transaction: OperationTransaction,
+):
+    rows = (
+        db.query(TankStockLedger)
+        .filter(
+            TankStockLedger.transaction_id == transaction.id,
+            TankStockLedger.status == "Active",
+        )
+        .all()
+    )
+
+    group_keys = set()
+    for row in rows:
+        row.status = "Correction Hold"
+        row.updated_at = datetime.now()
+        group_keys.add((row.location_code, row.tank_asset_code, row.product_name))
+
+    for location_code, tank_asset_code, product_name in group_keys:
+        rebuild_tank_stock_running_balances(
+            db=db,
+            location_code=location_code,
+            tank_asset_code=tank_asset_code,
+            product_name=product_name,
+        )
+
+    return {
+        "held_rows": len(rows),
+        "groups_rebuilt": len(group_keys),
+    }
+
+
+def restore_tank_stock_ledger_from_correction_hold(
+    db: Session,
+    transaction: OperationTransaction,
+):
+    rows = (
+        db.query(TankStockLedger)
+        .filter(
+            TankStockLedger.transaction_id == transaction.id,
+            TankStockLedger.status == "Correction Hold",
+        )
+        .all()
+    )
+
+    group_keys = set()
+    for row in rows:
+        row.status = "Active"
+        row.updated_at = datetime.now()
+        group_keys.add((row.location_code, row.tank_asset_code, row.product_name))
+
+    for location_code, tank_asset_code, product_name in group_keys:
+        rebuild_tank_stock_running_balances(
+            db=db,
+            location_code=location_code,
+            tank_asset_code=tank_asset_code,
+            product_name=product_name,
+        )
+
+    return {
+        "restored_rows": len(rows),
+        "groups_rebuilt": len(group_keys),
+    }
+
+
 def close_operation_approval_tasks_for_transaction(
     db: Session,
     transaction: OperationTransaction,
@@ -936,11 +1134,59 @@ def clean_optional_text(value):
 
 
 APPROVED_TRANSACTION_STATUS = "Approved"
+CORRECTION_HOLD_STATUS = "Pending Admin Review"
+APPROVED_CORRECTION_WINDOW_HOURS = 24
+
+
+def approved_transaction_not_on_correction_hold(db: Session):
+    return ~OperationTransaction.id.in_(
+        db.query(ApprovedTransactionCorrectionRequest.transaction_id).filter(
+            ApprovedTransactionCorrectionRequest.status == CORRECTION_HOLD_STATUS
+        )
+    )
+
+
+def transaction_has_pending_correction_request(db: Session, transaction_id: int):
+    return (
+        db.query(ApprovedTransactionCorrectionRequest.id)
+        .filter(
+            ApprovedTransactionCorrectionRequest.transaction_id == transaction_id,
+            ApprovedTransactionCorrectionRequest.status == CORRECTION_HOLD_STATUS,
+        )
+        .first()
+        is not None
+    )
+
+
+def get_latest_transaction_approval_time(db: Session, transaction_id: int):
+    latest_history = (
+        db.query(OperationTransactionStatusHistory)
+        .filter(
+            OperationTransactionStatusHistory.transaction_id == transaction_id,
+            OperationTransactionStatusHistory.new_status == APPROVED_TRANSACTION_STATUS,
+        )
+        .order_by(OperationTransactionStatusHistory.changed_at.desc())
+        .first()
+    )
+    return latest_history.changed_at if latest_history else None
+
+
+def ensure_approved_correction_window_open(db: Session, transaction: OperationTransaction):
+    approved_at = get_latest_transaction_approval_time(db, transaction.id)
+    if not approved_at:
+        approved_at = transaction.updated_at or transaction.created_at
+
+    if approved_at and datetime.now() > approved_at + timedelta(hours=APPROVED_CORRECTION_WINDOW_HOURS):
+        raise HTTPException(
+            status_code=400,
+            detail="Approved transaction correction window expired after 24 hours",
+        )
 
 
 def require_approved_transaction_for_tracking(
     transaction: OperationTransaction | None,
     action_label: str = "tracking",
+    db: Session | None = None,
 ):
     if not transaction:
         raise HTTPException(
@@ -954,6 +1200,15 @@ def require_approved_transaction_for_tracking(
             detail=(
                 f"Only Approved transactions can be used for {action_label}. "
                 f"Current status is {transaction.status}."
+            ),
+        )
+
+    if db is not None and transaction_has_pending_correction_request(db, transaction.id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This approved transaction is marked for correction and cannot be used for {action_label} "
+                "until the correction request is resolved and the ticket is approved again."
             ),
         )
 
@@ -3193,7 +3448,7 @@ def seed_standard_permissions(
             "description": "Can view Vessel Stock Ledger (approved-only derived ledger for Shuttle/FSO)",
         },
 
-        # Movement Mapping (Barge ↔ Shuttle ↔ FSO reconciliation)
+        # Movement Mapping (Barge â†” Shuttle â†” FSO reconciliation)
         {
             "permission_name": "View Movement Mapping",
             "module_name": "Operations",
@@ -3288,6 +3543,21 @@ def seed_standard_permissions(
             "permission_name": "Cancel Operation Transaction",
             "module_name": "Operations",
             "description": "Can cancel draft or rejected operation tickets",
+        },
+        {
+            "permission_name": "Request Approved Transaction Correction",
+            "module_name": "Operations",
+            "description": "Can request admin revoke for approved operation tickets that need correction",
+        },
+        {
+            "permission_name": "View Approved Transaction Correction Requests",
+            "module_name": "Operations",
+            "description": "Can view approved transaction correction and revoke requests",
+        },
+        {
+            "permission_name": "Admin Revoke Approved Transaction",
+            "module_name": "Operations",
+            "description": "Can revoke approval and push approved tickets back to submitted review",
         },
         # Barge Seal Master
         {
@@ -8494,7 +8764,7 @@ def extract_transaction_quantities(db: Session, transaction: OperationTransactio
         nsv = abs(safe_float(net.get("NSV")))
         return qty, water, nsv
 
-    # ✅ Shuttle payload (Shuttle Tracking)
+    # âœ… Shuttle payload (Shuttle Tracking)
     payload_row = (
         db.query(OperationTransactionValue)
         .filter(
@@ -11137,6 +11407,7 @@ def build_fso_otr_report(
         .join(OperationTransactionValue, OperationTransactionValue.transaction_id == OperationTransaction.id)
         .filter(
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTransaction.origin_location_code == loc_code,
             OperationTransaction.primary_asset_code == asset_code,
             OperationTransaction.operation_date >= date_from,
@@ -11172,7 +11443,7 @@ def build_fso_otr_report(
         movement_qty = abs(net_stock) + abs(net_water)
 
         vessel_qty = float(safe_float(inputs.get("vessel_quantity_bbl")))
-        # ✅ your final variance rule
+        # âœ… your final variance rule
         variance = abs(net_stock + net_water) - vessel_qty
 
         src_discharge = float(safe_float(meta.get("source_shuttle_discharge_bbl")))
@@ -11235,6 +11506,7 @@ def build_fso_material_balance(
         .join(OperationTransactionValue, OperationTransactionValue.transaction_id == OperationTransaction.id)
         .filter(
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTransaction.origin_location_code == loc_code,
             OperationTransaction.primary_asset_code == asset_code,
             OperationTransaction.operation_date >= date_from,
@@ -11330,6 +11602,7 @@ def build_fso_outturn_report(
         .join(OperationTransactionValue, OperationTransactionValue.transaction_id == OperationTransaction.id)
         .filter(
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTransaction.origin_location_code == loc_code,
             OperationTransaction.primary_asset_code == asset_code,
             OperationTransaction.operation_date >= date_from,
@@ -11791,7 +12064,7 @@ def create_audit_log(
     if current_user:
         performed_by = get_current_user_display_name(current_user)
 
-    # ✅ Convert datetime/date/Decimal/etc into JSON-safe values
+    # âœ… Convert datetime/date/Decimal/etc into JSON-safe values
     safe_details = jsonable_encoder(details) if details is not None else None
 
     audit_log = AuditLog(
@@ -13277,7 +13550,7 @@ VALID_ENTRY_LAYOUT_TYPES = [
     "Tanker Loading",
     "Meter Reading",
     "Shuttle Tracking",
-    "FSO Tracking",   # ✅ NEW
+    "FSO Tracking",   # âœ… NEW
 ]
 
 VALID_CALCULATION_ENGINES = [
@@ -14474,13 +14747,13 @@ def create_operation_entry(
     if policy_allowed is False:
         raise HTTPException(status_code=403, detail=f"Workflow policy denied action: {policy_reason}")
 
-    # ✅ Trip lock ONLY for barges (avoid blocking shuttle/tanker convoy numbers)
+    # âœ… Trip lock ONLY for barges (avoid blocking shuttle/tanker convoy numbers)
     trip = None
     if str(operation_type.applicable_asset_type_code or "").strip().upper() == "BARGE":
         trip = get_trip_by_convoy_or_none(db, entry.transaction.convoy_number)
         ensure_trip_not_closed(trip)
 
-    # ✅ Shuttle lock ONLY for Shuttle Tracking templates
+    # âœ… Shuttle lock ONLY for Shuttle Tracking templates
     if str(template.entry_layout_type or "").strip() == "Shuttle Tracking":
         voyage = get_or_create_shuttle_voyage(
             db=db,
@@ -15701,6 +15974,7 @@ def get_tanker_tracking_rows(
             OperationTransactionValue.field_code == "tanker_payload",
             OperationTransactionValue.field_value != None,
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
     )
 
@@ -15930,11 +16204,11 @@ def get_tanker_sender_reference(
             detail="Sender tanker transaction not found",
         )
 
-    if sender_transaction.status != APPROVED_TRANSACTION_STATUS:
-        raise HTTPException(
-            status_code=400,
-            detail="Only Approved sender tanker transactions can be used as receiver reference",
-        )
+    require_approved_transaction_for_tracking(
+        sender_transaction,
+        "receiver reference",
+        db=db,
+    )
 
     tanker_payload = get_tanker_payload_for_transaction(
         db,
@@ -16048,14 +16322,11 @@ def acknowledge_tanker_receipt(
             detail="Sender tanker transaction not found",
         )
 
-    if sender_transaction.status != APPROVED_TRANSACTION_STATUS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Only Approved sender tanker transactions can be acknowledged "
-                "by the receiver"
-            ),
-        )
+    require_approved_transaction_for_tracking(
+        sender_transaction,
+        "receiver acknowledgement",
+        db=db,
+    )
 
     tanker_payload = get_tanker_payload_for_transaction(
         db,
@@ -16324,6 +16595,7 @@ def close_tanker_tracking_movement(
     require_approved_transaction_for_tracking(
         sender_transaction,
         "tanker movement closure",
+        db=db,
     )
 
     tracking_rows = get_tanker_tracking_rows(
@@ -16604,7 +16876,7 @@ def get_shuttle_tracking(
     location_code: str | None = None,
     shuttle_number: str | None = None,
     shuttle_asset_code: str | None = None,
-    # ✅ NEW enterprise params
+    # âœ… NEW enterprise params
     tab: str | None = None,          # OPEN / CLOSED
     search: str | None = None,       # keyword search
     page: int = 1,
@@ -16692,6 +16964,7 @@ def get_shuttle_tracking(
         .filter(
             OperationTransactionValue.field_code == "shuttle_payload",
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
     )
 
@@ -16798,7 +17071,7 @@ def get_shuttle_tracking(
 
     # If list-only mode, return voyages without tickets (fast)
     if not include_tickets:
-        # ✅ Compute totals for voyages on this page WITHOUT returning ticket list
+        # âœ… Compute totals for voyages on this page WITHOUT returning ticket list
         # Pull only shuttle_payload values for these keys and sum net fields.
         key_filters = []
         for (loc_code, sh_num, asset_code) in keys:
@@ -16824,6 +17097,7 @@ def get_shuttle_tracking(
             .filter(
                 OperationTransactionValue.field_code == "shuttle_payload",
                 OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+                approved_transaction_not_on_correction_hold(db),
             )
             .filter(or_(*key_filters))
             .all()
@@ -16898,6 +17172,7 @@ def get_shuttle_tracking(
         .filter(
             OperationTransactionValue.field_code == "shuttle_payload",
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
     )
 
@@ -17117,6 +17392,7 @@ def export_shuttle_voyage_xlsx(
         .filter(
             OperationTransactionValue.field_code == "shuttle_payload",
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTransaction.origin_location_code == loc_code,
             OperationTransaction.convoy_number == shuttle_no,
             OperationTransaction.primary_asset_code == asset_code,
@@ -17354,6 +17630,7 @@ def get_fso_tracking(
             .filter(
                 OperationTransactionValue.field_code == "shuttle_payload",
                 OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+                approved_transaction_not_on_correction_hold(db),
             )
             .filter(or_(*tx_filters))
             .all()
@@ -17389,6 +17666,7 @@ def get_fso_tracking(
         )
         .filter(
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTransactionValue.field_code == "fso_payload",
         )
     )
@@ -17493,6 +17771,7 @@ def get_fso_tracking(
             .join(OperationTransactionValue, OperationTransactionValue.transaction_id == OperationTransaction.id)
             .filter(
                 OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+                approved_transaction_not_on_correction_hold(db),
                 OperationTransactionValue.field_code == "fso_payload",
             )
             .filter(or_(*key_filters))
@@ -17642,6 +17921,7 @@ def get_fso_tracking(
         .filter(
             OperationTransactionValue.field_code == "fso_payload",
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
         .filter(or_(*key_filters))
         .order_by(OperationTransaction.operation_date.asc(), OperationTransaction.id.asc())
@@ -17825,6 +18105,7 @@ def get_convoy_tracker(
         .filter(
             OperationTransaction.convoy_number.ilike(convoy),
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
         .order_by(
             OperationTransaction.operation_date.asc(),
@@ -17894,7 +18175,7 @@ def ensure_barge_unload_comparison(
     if not trip or not unload_tx:
         return None
 
-    require_approved_transaction_for_tracking(unload_tx, "barge comparison")
+    require_approved_transaction_for_tracking(unload_tx, "barge comparison", db=db)
 
     asset = str(asset_code or "").strip()
     if not asset:
@@ -17924,7 +18205,7 @@ def ensure_barge_unload_comparison(
         .first()
     )
 
-    require_approved_transaction_for_tracking(left_tx, "barge comparison")
+    require_approved_transaction_for_tracking(left_tx, "barge comparison", db=db)
 
     existing = (
         db.query(TripComparison)
@@ -18030,10 +18311,11 @@ def create_trip_event(
                 detail="asset_code does not match the operation ticket primary_asset_code",
             )
 
-        # ✅ Approved-only rule for any event linked to a ticket
+        # âœ… Approved-only rule for any event linked to a ticket
         require_approved_transaction_for_tracking(
             tx,
             "barge timeline event",
+            db=db,
         )
 
         # Align convoy if needed
@@ -18046,7 +18328,7 @@ def create_trip_event(
                 detail="Ticket convoy_number does not match request convoy_number",
             )
 
-        # ✅ Idempotency: if the ticket already has an event, UPDATE it instead of INSERT
+        # âœ… Idempotency: if the ticket already has an event, UPDATE it instead of INSERT
         existing_event_for_ticket = (
             db.query(TripEvent)
             .filter(TripEvent.operation_transaction_id == tx.id)
@@ -18075,7 +18357,7 @@ def create_trip_event(
             db.commit()
             db.refresh(existing_event_for_ticket)
 
-            # ✅ If timeline is being corrected to UNLOAD, backfill comparison now
+            # âœ… If timeline is being corrected to UNLOAD, backfill comparison now
             if tx and str(existing_event_for_ticket.event_type or "").strip().upper() == "UNLOAD":
                 trip_for_cmp = db.query(Trip).filter(Trip.convoy_number.ilike(convoy)).first()
                 if trip_for_cmp:
@@ -18173,7 +18455,7 @@ def create_trip_event(
         db.add(new_event)
         db.flush()
     except IntegrityError:
-        # ✅ Safety net (race/duplicate click): fetch existing + update instead of 500
+        # âœ… Safety net (race/duplicate click): fetch existing + update instead of 500
         db.rollback()
 
         if op_tx_id is not None:
@@ -18238,7 +18520,7 @@ def create_trip_event(
         },
     )
 
-    # ✅ If this newly created event is UNLOAD and linked to an approved ticket, create comparison
+    # âœ… If this newly created event is UNLOAD and linked to an approved ticket, create comparison
     if tx and str(new_event.event_type or "").strip().upper() == "UNLOAD":
         ensure_barge_unload_comparison(
             db=db,
@@ -18350,7 +18632,7 @@ def get_trip_timeline_by_convoy(
             .first()
         )
 
-        # ✅ Backfill missing JSON for older comparisons (fixes blank reports)
+        # âœ… Backfill missing JSON for older comparisons (fixes blank reports)
         if (
             cmp.summary_json is None or cmp.per_tank_json is None
         ) and left_tx and right_tx:
@@ -18713,11 +18995,13 @@ def create_trip_comparison(
     require_approved_transaction_for_tracking(
         left_tx,
         "barge sender/receiver comparison",
+        db=db,
     )
 
     require_approved_transaction_for_tracking(
         right_tx,
         "barge sender/receiver comparison",
+        db=db,
     )
 
     # Align ticket convoy if missing
@@ -18758,7 +19042,7 @@ def create_trip_comparison(
             if per_tank_json is None:
                 per_tank_json = auto_per_tank
 
-    # ✅ Prevent empty comparison records (this is why your report shows blanks)
+    # âœ… Prevent empty comparison records (this is why your report shows blanks)
     if summary_json is None or per_tank_json is None:
         raise HTTPException(
             status_code=400,
@@ -19007,6 +19291,7 @@ def require_barge_tracking_ready_for_closure(
         .filter(
             OperationTransaction.convoy_number.ilike(trip.convoy_number),
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTransaction.primary_asset_type_code.ilike("BARGE"),
         )
         .all()
@@ -19065,6 +19350,12 @@ def require_barge_tracking_ready_for_closure(
             continue
 
         if right_tx.status != APPROVED_TRANSACTION_STATUS:
+            continue
+
+        if transaction_has_pending_correction_request(db, left_tx.id):
+            continue
+
+        if transaction_has_pending_correction_request(db, right_tx.id):
             continue
 
         if str(left_tx.primary_asset_code or "").strip().lower() != str(
@@ -19736,7 +20027,10 @@ def create_tank_stock_ledger_from_approved_transaction(
 
     existing_ledger = (
         db.query(TankStockLedger)
-        .filter(TankStockLedger.transaction_id == transaction.id)
+        .filter(
+            TankStockLedger.transaction_id == transaction.id,
+            TankStockLedger.status.in_(["Active", "Correction Hold"]),
+        )
         .first()
     )
 
@@ -20932,6 +21226,510 @@ def get_operation_transaction_status_history(
     ]
 
 
+@app.post(
+    "/operation-transactions/{transaction_id}/correction-requests",
+    response_model=ApprovedTransactionCorrectionRequestResponse,
+)
+def create_approved_transaction_correction_request(
+    transaction_id: int,
+    request: ApprovedTransactionCorrectionRequestCreate,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    if not (
+        user_has_permission(current_user, "Request Approved Transaction Correction", db)
+        or user_has_permission(current_user, "Approve Operation Transaction", db)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Permission required: Request Approved Transaction Correction or Approve Operation Transaction",
+        )
+
+    transaction = (
+        db.query(OperationTransaction)
+        .filter(OperationTransaction.id == transaction_id)
+        .first()
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Operation transaction not found")
+    if transaction.status != APPROVED_TRANSACTION_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only Approved transactions can be marked for correction",
+        )
+    ensure_approved_correction_window_open(db, transaction)
+
+    request_type = clean_optional_text(request.request_type)
+    suggested_action = clean_optional_text(request.suggested_action)
+    reason = clean_optional_text(request.reason)
+    if not request_type:
+        raise HTTPException(status_code=400, detail="Correction type is required")
+    if not suggested_action:
+        raise HTTPException(status_code=400, detail="Suggested action is required")
+    if not reason:
+        raise HTTPException(status_code=400, detail="Reason is required")
+
+    existing = (
+        db.query(ApprovedTransactionCorrectionRequest)
+        .filter(
+            ApprovedTransactionCorrectionRequest.transaction_id == transaction.id,
+            ApprovedTransactionCorrectionRequest.status == "Pending Admin Review",
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="A pending correction request already exists for this approved transaction",
+        )
+
+    correction_request = ApprovedTransactionCorrectionRequest(
+        request_number=generate_correction_request_number(db),
+        transaction_id=transaction.id,
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        request_type=request_type,
+        suggested_action=suggested_action,
+        reason=reason,
+        status="Pending Admin Review",
+        requested_by_user_id=current_user.id,
+        requested_by_display=get_current_user_display_name(current_user),
+        requested_at=datetime.now(),
+    )
+    db.add(correction_request)
+    db.flush()
+
+    task = create_approved_transaction_revoke_task(
+        db=db,
+        transaction=transaction,
+        correction_request=correction_request,
+        current_user=current_user,
+    )
+
+    ledger_hold_result = set_tank_stock_ledger_correction_hold(
+        db=db,
+        transaction=transaction,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Transaction Correction",
+        action="Request Approved Transaction Correction",
+        current_user=current_user,
+        entity_type="ApprovedTransactionCorrectionRequest",
+        entity_id=correction_request.id,
+        entity_label=correction_request.request_number,
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        old_status=transaction.status,
+        new_status=transaction.status,
+        remarks=reason,
+        request_path=f"/operation-transactions/{transaction_id}/correction-requests",
+        details={
+            "transaction_id": transaction.id,
+            "task_id": task.id,
+            "request_type": request_type,
+            "suggested_action": suggested_action,
+            "reason": reason,
+            "correction_window_hours": APPROVED_CORRECTION_WINDOW_HOURS,
+            "ledger_hold_result": ledger_hold_result,
+        },
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Tank Stock Ledger",
+        action="Hold Ledger Rows On Correction Request",
+        current_user=current_user,
+        entity_type="OperationTransaction",
+        entity_id=transaction.id,
+        entity_label=get_transaction_ticket_number(transaction),
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        remarks="Derived tank stock ledger rows placed on correction hold",
+        request_path=f"/operation-transactions/{transaction_id}/correction-requests",
+        details=ledger_hold_result,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Task",
+        action="Create Approved Transaction Revoke Task",
+        current_user=current_user,
+        entity_type="OperationTask",
+        entity_id=task.id,
+        entity_label=task.task_number,
+        ticket_number=task.ticket_number,
+        operation_number=task.operation_number,
+        new_status=task.status,
+        remarks="Admin revoke task created from approved transaction correction request",
+        request_path=f"/operation-transactions/{transaction_id}/correction-requests",
+        details={
+            "correction_request_id": correction_request.id,
+            "request_number": correction_request.request_number,
+            "assigned_role_ids": task.assigned_role_ids_json,
+        },
+    )
+
+    db.commit()
+    db.refresh(correction_request)
+    return build_correction_request_response(correction_request)
+
+
+@app.get(
+    "/operation-transactions/{transaction_id}/correction-requests",
+    response_model=list[ApprovedTransactionCorrectionRequestResponse],
+)
+def get_transaction_correction_requests(
+    transaction_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "View Operation Transaction", db)
+    rows = (
+        db.query(ApprovedTransactionCorrectionRequest)
+        .filter(ApprovedTransactionCorrectionRequest.transaction_id == transaction_id)
+        .order_by(
+            ApprovedTransactionCorrectionRequest.created_at.desc(),
+            ApprovedTransactionCorrectionRequest.id.desc(),
+        )
+        .all()
+    )
+    return [build_correction_request_response(row) for row in rows]
+
+
+def get_pending_correction_request_for_task(db: Session, task_id: int):
+    row = (
+        db.query(ApprovedTransactionCorrectionRequest)
+        .filter(
+            ApprovedTransactionCorrectionRequest.task_id == task_id,
+            ApprovedTransactionCorrectionRequest.status == "Pending Admin Review",
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending approved transaction correction request not found for this task",
+        )
+    return row
+
+
+@app.post(
+    "/operation-tasks/{task_id}/admin-reject-approved-revoke",
+    response_model=ApprovedTransactionCorrectionRequestResponse,
+)
+def admin_reject_approved_transaction_revoke_request(
+    task_id: int,
+    payload: ApprovedTransactionCorrectionAdminAction,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Admin Revoke Approved Transaction", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task or task.task_type != "APPROVED_TRANSACTION_REVOKE_REQUEST":
+        raise HTTPException(status_code=404, detail="Approved transaction revoke task not found")
+    if task.status not in ["Pending", "In Progress"]:
+        raise HTTPException(status_code=400, detail="Only open revoke tasks can be rejected")
+    if not user_can_act_on_operation_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="You are not assigned to this task")
+
+    correction_request = get_pending_correction_request_for_task(db, task.id)
+    transaction = (
+        db.query(OperationTransaction)
+        .filter(OperationTransaction.id == correction_request.transaction_id)
+        .first()
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Operation transaction not found")
+
+    remarks = clean_optional_text(payload.remarks) or "Admin rejected approved transaction revoke request"
+    ledger_restore_result = restore_tank_stock_ledger_from_correction_hold(
+        db=db,
+        transaction=transaction,
+    )
+
+    old_task_status = task.status
+    task.status = "Rejected"
+    task.action_taken = "Admin Rejected"
+    task.acted_by_user_id = current_user.id
+    task.acted_at = datetime.now()
+    task.remarks = remarks
+    task.updated_at = datetime.now()
+
+    correction_request.status = "Admin Rejected"
+    correction_request.admin_action = "Rejected"
+    correction_request.admin_remarks = remarks
+    correction_request.admin_user_id = current_user.id
+    correction_request.admin_action_at = datetime.now()
+    correction_request.updated_at = datetime.now()
+
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Admin Rejected",
+        current_user=current_user,
+        old_status=old_task_status,
+        new_status=task.status,
+        notes=remarks,
+        details={"correction_request_id": correction_request.id},
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Transaction Correction",
+        action="Reject Approved Transaction Correction Request",
+        current_user=current_user,
+        entity_type="ApprovedTransactionCorrectionRequest",
+        entity_id=correction_request.id,
+        entity_label=correction_request.request_number,
+        ticket_number=correction_request.ticket_number,
+        operation_number=correction_request.operation_number,
+        old_status="Pending Admin Review",
+        new_status=correction_request.status,
+        remarks=remarks,
+        request_path=f"/operation-tasks/{task_id}/admin-reject-approved-revoke",
+        details={
+            "task_id": task.id,
+            "transaction_id": correction_request.transaction_id,
+            "request_type": correction_request.request_type,
+            "suggested_action": correction_request.suggested_action,
+            "ledger_restore_result": ledger_restore_result,
+        },
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Tank Stock Ledger",
+        action="Restore Ledger Rows After Correction Rejection",
+        current_user=current_user,
+        entity_type="OperationTransaction",
+        entity_id=transaction.id,
+        entity_label=get_transaction_ticket_number(transaction),
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        remarks="Correction request rejected; held tank stock ledger rows restored",
+        request_path=f"/operation-tasks/{task_id}/admin-reject-approved-revoke",
+        details=ledger_restore_result,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Task",
+        action="Task Admin Rejected",
+        current_user=current_user,
+        entity_type="OperationTask",
+        entity_id=task.id,
+        entity_label=task.task_number,
+        ticket_number=task.ticket_number,
+        operation_number=task.operation_number,
+        old_status=old_task_status,
+        new_status=task.status,
+        remarks=remarks,
+        request_path=f"/operation-tasks/{task_id}/admin-reject-approved-revoke",
+        details={
+            "task_type": task.task_type,
+            "correction_request_id": correction_request.id,
+            "request_number": correction_request.request_number,
+        },
+    )
+
+    db.commit()
+    db.refresh(correction_request)
+    return build_correction_request_response(correction_request)
+
+
+@app.post(
+    "/operation-tasks/{task_id}/admin-revoke-approved-transaction",
+    response_model=ApprovedTransactionCorrectionRequestResponse,
+)
+def admin_revoke_approved_transaction_from_task(
+    task_id: int,
+    payload: ApprovedTransactionCorrectionAdminAction,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Admin Revoke Approved Transaction", db)
+    task = db.query(OperationTask).filter(OperationTask.id == task_id).first()
+    if not task or task.task_type != "APPROVED_TRANSACTION_REVOKE_REQUEST":
+        raise HTTPException(status_code=404, detail="Approved transaction revoke task not found")
+    if task.status not in ["Pending", "In Progress"]:
+        raise HTTPException(status_code=400, detail="Only open revoke tasks can be acted on")
+    if not user_can_act_on_operation_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="You are not assigned to this task")
+
+    correction_request = get_pending_correction_request_for_task(db, task.id)
+    transaction = (
+        db.query(OperationTransaction)
+        .filter(OperationTransaction.id == correction_request.transaction_id)
+        .first()
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Operation transaction not found")
+    if transaction.status != APPROVED_TRANSACTION_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only currently Approved transactions can be revoked",
+        )
+
+    remarks = clean_optional_text(payload.remarks) or "Admin revoked approval for operational correction"
+    changed_by = get_current_user_display_name(current_user)
+    old_transaction_status = transaction.status
+
+    ledger_result = reverse_tank_stock_ledger_for_revoked_transaction(
+        db=db,
+        transaction=transaction,
+    )
+
+    transaction.status = "Submitted"
+    transaction.updated_at = datetime.now()
+    existing_remarks = transaction.remarks or ""
+    transaction.remarks = (
+        f"{existing_remarks}\n"
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"{changed_by} revoked approval from {old_transaction_status} to Submitted: "
+        f"{remarks}"
+    ).strip()
+
+    history = OperationTransactionStatusHistory(
+        transaction_id=transaction.id,
+        old_status=old_transaction_status,
+        new_status="Submitted",
+        changed_by=changed_by,
+        remarks=f"[ADMIN APPROVAL REVOKE] {remarks}",
+        changed_at=datetime.now(),
+    )
+    db.add(history)
+
+    old_task_status = task.status
+    task.status = "Approved"
+    task.action_taken = "Admin Revoked"
+    task.acted_by_user_id = current_user.id
+    task.acted_at = datetime.now()
+    task.remarks = remarks
+    task.updated_at = datetime.now()
+
+    correction_request.status = "Admin Revoked"
+    correction_request.admin_action = "Revoked"
+    correction_request.admin_remarks = remarks
+    correction_request.admin_user_id = current_user.id
+    correction_request.admin_action_at = datetime.now()
+    correction_request.previous_status_before_revoke = old_transaction_status
+    correction_request.new_status_after_revoke = "Submitted"
+    correction_request.updated_at = datetime.now()
+
+    add_operation_task_event(
+        db=db,
+        task=task,
+        event_type="Admin Revoked",
+        current_user=current_user,
+        old_status=old_task_status,
+        new_status=task.status,
+        notes=remarks,
+        details={
+            "correction_request_id": correction_request.id,
+            "old_transaction_status": old_transaction_status,
+            "new_transaction_status": "Submitted",
+            "ledger_result": ledger_result,
+        },
+    )
+
+    approval_task = create_operation_approval_task_for_transaction(
+        db=db,
+        transaction=transaction,
+        current_user=current_user,
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Transaction",
+        action="Admin Revoke Approved Transaction",
+        current_user=current_user,
+        entity_type="OperationTransaction",
+        entity_id=transaction.id,
+        entity_label=get_transaction_ticket_number(transaction),
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        old_status=old_transaction_status,
+        new_status="Submitted",
+        remarks=remarks,
+        request_path=f"/operation-tasks/{task_id}/admin-revoke-approved-transaction",
+        details={
+            "correction_request_id": correction_request.id,
+            "correction_request_number": correction_request.request_number,
+            "request_type": correction_request.request_type,
+            "suggested_action": correction_request.suggested_action,
+            "reason": correction_request.reason,
+            "revoke_task_id": task.id,
+            "new_approval_task_id": approval_task.id,
+            "ledger_result": ledger_result,
+        },
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Transaction Correction",
+        action="Admin Revoke Approved Transaction Correction Request",
+        current_user=current_user,
+        entity_type="ApprovedTransactionCorrectionRequest",
+        entity_id=correction_request.id,
+        entity_label=correction_request.request_number,
+        ticket_number=correction_request.ticket_number,
+        operation_number=correction_request.operation_number,
+        old_status="Pending Admin Review",
+        new_status=correction_request.status,
+        remarks=remarks,
+        request_path=f"/operation-tasks/{task_id}/admin-revoke-approved-transaction",
+        details={
+            "transaction_id": transaction.id,
+            "old_transaction_status": old_transaction_status,
+            "new_transaction_status": "Submitted",
+            "new_approval_task_id": approval_task.id,
+        },
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Operation Task",
+        action="Task Admin Revoked",
+        current_user=current_user,
+        entity_type="OperationTask",
+        entity_id=task.id,
+        entity_label=task.task_number,
+        ticket_number=task.ticket_number,
+        operation_number=task.operation_number,
+        old_status=old_task_status,
+        new_status=task.status,
+        remarks=remarks,
+        request_path=f"/operation-tasks/{task_id}/admin-revoke-approved-transaction",
+        details={
+            "task_type": task.task_type,
+            "correction_request_id": correction_request.id,
+            "request_number": correction_request.request_number,
+            "new_approval_task_id": approval_task.id,
+        },
+    )
+
+    create_audit_log(
+        db=db,
+        module_name="Tank Stock Ledger",
+        action="Reverse Ledger Rows On Approval Revoke",
+        current_user=current_user,
+        entity_type="OperationTransaction",
+        entity_id=transaction.id,
+        entity_label=get_transaction_ticket_number(transaction),
+        ticket_number=get_transaction_ticket_number(transaction),
+        operation_number=transaction.operation_number,
+        remarks="Derived tank stock ledger rows reversed because approval was revoked",
+        request_path=f"/operation-tasks/{task_id}/admin-revoke-approved-transaction",
+        details=ledger_result,
+    )
+
+    db.commit()
+    db.refresh(correction_request)
+    return build_correction_request_response(correction_request)
+
+
 @app.put(
     "/operation-entries/{transaction_id}",
     response_model=OperationEntryResponse,
@@ -21192,7 +21990,7 @@ def interpolate_table11_factor(api60: float, db: Session):
     if api60 is None:
         raise HTTPException(
             status_code=400,
-            detail="API @ 60°F is required",
+            detail="API @ 60Â°F is required",
         )
 
     api_value = float(api60)
@@ -21375,19 +22173,19 @@ def bulk_save_table11_factors(
     if len(api_values) != len(set(api_values)):
         raise HTTPException(
             status_code=400,
-            detail="Duplicate API @ 60°F values are not allowed",
+            detail="Duplicate API @ 60Â°F values are not allowed",
         )
 
     for row in request.rows:
         if row.api60 <= 0:
             raise HTTPException(
                 status_code=400,
-                detail="API @ 60°F must be greater than zero",
+                detail="API @ 60Â°F must be greater than zero",
             )
         if row.lt_factor <= 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"LT factor must be greater than zero for API @ 60°F {row.api60}",
+                detail=f"LT factor must be greater than zero for API @ 60Â°F {row.api60}",
             )
 
     before_snapshot = build_table11_audit_snapshot(db, preview_limit=20)
@@ -23418,6 +24216,7 @@ def build_shuttle_summary_rows(
         .filter(
             OperationTransactionValue.field_code == "shuttle_payload",
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
     )
 
@@ -23519,6 +24318,7 @@ def build_shuttle_summary_rows(
         .filter(
             OperationTransactionValue.field_code == "shuttle_payload",
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
         )
         .filter(or_(*key_filters))
         .all()
@@ -25299,6 +26099,7 @@ def get_flowmeter_records(
         )
         .filter(
             OperationTransaction.status == APPROVED_TRANSACTION_STATUS,
+            approved_transaction_not_on_correction_hold(db),
             OperationTemplate.entry_layout_type == "Meter Reading",
         )
     )

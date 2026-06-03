@@ -232,6 +232,42 @@ class OperationTaskEventResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ApprovedTransactionCorrectionRequestCreate(BaseModel):
+    request_type: str
+    suggested_action: str
+    reason: str
+
+
+class ApprovedTransactionCorrectionAdminAction(BaseModel):
+    remarks: Optional[str] = None
+
+
+class ApprovedTransactionCorrectionRequestResponse(BaseModel):
+    id: int
+    request_number: str
+    transaction_id: int
+    task_id: Optional[int] = None
+    ticket_number: Optional[str] = None
+    operation_number: Optional[str] = None
+    request_type: str
+    suggested_action: str
+    reason: str
+    status: str
+    requested_by_user_id: Optional[int] = None
+    requested_by_display: Optional[str] = None
+    requested_at: datetime
+    admin_action: Optional[str] = None
+    admin_remarks: Optional[str] = None
+    admin_user_id: Optional[int] = None
+    admin_action_at: Optional[datetime] = None
+    previous_status_before_revoke: Optional[str] = None
+    new_status_after_revoke: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class LocationBase(BaseModel):
     location_name: str
     location_code: str
