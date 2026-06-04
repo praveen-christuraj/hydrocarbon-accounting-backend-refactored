@@ -1639,6 +1639,215 @@ class AuditLogResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class SystemNotificationBase(BaseModel):
+    title: str
+    message: str
+    notification_type: str = "Info"
+    priority: str = "Normal"
+    delivery_mode: str = "Banner + Inbox"
+    target_scope: str = "All Users"
+    target_role_ids: Optional[list[int]] = None
+    target_user_ids: Optional[list[int]] = None
+    target_location_codes: Optional[list[str]] = None
+    display_from: Optional[datetime] = None
+    display_until: Optional[datetime] = None
+    requires_acknowledgement: bool = False
+    popup_enabled: bool = False
+    banner_enabled: bool = True
+    auto_dismiss_seconds: Optional[int] = None
+
+
+class SystemNotificationCreate(SystemNotificationBase):
+    status: str = "Draft"
+
+
+class SystemNotificationUpdate(SystemNotificationBase):
+    status: Optional[str] = None
+
+
+class SystemNotificationActionRequest(BaseModel):
+    remarks: Optional[str] = None
+
+
+class SystemNotificationResponse(BaseModel):
+    id: int
+    notification_number: str
+    title: str
+    message: str
+    notification_type: str
+    priority: str
+    delivery_mode: str
+    target_scope: str
+    target_role_ids: Optional[list[int]] = None
+    target_user_ids: Optional[list[int]] = None
+    target_location_codes: Optional[list[str]] = None
+    display_from: Optional[datetime] = None
+    display_until: Optional[datetime] = None
+    requires_acknowledgement: bool
+    popup_enabled: bool
+    banner_enabled: bool
+    auto_dismiss_seconds: Optional[int] = None
+    status: str
+    created_by_user_id: Optional[int] = None
+    created_by_display: Optional[str] = None
+    published_at: Optional[datetime] = None
+    deactivated_at: Optional[datetime] = None
+    deactivation_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    receipt_status: Optional[str] = None
+    first_seen_at: Optional[datetime] = None
+    dismissed_at: Optional[datetime] = None
+    acknowledged_at: Optional[datetime] = None
+    delivery_count: int = 0
+    seen_count: int = 0
+    acknowledged_count: int = 0
+    dismissed_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SystemNotificationReceiptResponse(BaseModel):
+    id: int
+    notification_id: int
+    user_id: int
+    username: Optional[str] = None
+    delivered_at: datetime
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    dismissed_at: Optional[datetime] = None
+    acknowledged_at: Optional[datetime] = None
+    acknowledgement_remarks: Optional[str] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BackupSettingsUpdate(BaseModel):
+    enabled: bool = False
+    schedule_mode: str = "Daily"
+    interval_value: int = 24
+    run_time: str = "02:00"
+    retention_days: int = 30
+    keep_minimum: int = 5
+    backup_directory: Optional[str] = None
+    compression_enabled: bool = True
+
+
+class BackupSettingsResponse(BaseModel):
+    id: int
+    enabled: bool
+    schedule_mode: str
+    interval_value: int
+    run_time: str
+    retention_days: int
+    keep_minimum: int
+    backup_directory: Optional[str] = None
+    compression_enabled: bool
+    status: str
+    next_run_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BackupManualCreate(BaseModel):
+    description: Optional[str] = None
+
+
+class BackupJobResponse(BaseModel):
+    id: int
+    backup_number: str
+    backup_type: str
+    trigger_source: str
+    status: str
+    description: Optional[str] = None
+    file_name: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    checksum_sha256: Optional[str] = None
+    database_name: Optional[str] = None
+    backup_format: str
+    requested_by_user_id: Optional[int] = None
+    requested_by_display: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    metadata_json: Optional[Any] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BackupRestoreRequestCreate(BaseModel):
+    backup_job_id: int
+    reason: str
+    business_impact: Optional[str] = None
+
+
+class BackupRestoreRequestAction(BaseModel):
+    remarks: Optional[str] = None
+
+
+class BackupRestoreExecuteRequest(BaseModel):
+    confirmation_text: str
+    remarks: Optional[str] = None
+
+
+class BackupRestoreRequestResponse(BaseModel):
+    id: int
+    request_number: str
+    backup_job_id: int
+    backup_number: str
+    status: str
+    reason: str
+    business_impact: Optional[str] = None
+    requested_by_user_id: Optional[int] = None
+    requested_by_display: Optional[str] = None
+    requested_at: datetime
+    approved_by_user_id: Optional[int] = None
+    approved_by_display: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    rejected_by_user_id: Optional[int] = None
+    rejected_by_display: Optional[str] = None
+    rejected_at: Optional[datetime] = None
+    cancelled_by_user_id: Optional[int] = None
+    cancelled_by_display: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+    action_remarks: Optional[str] = None
+    metadata_json: Optional[Any] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BackupRestoreValidationResponse(BaseModel):
+    id: int
+    validation_number: str
+    restore_request_id: int
+    backup_job_id: int
+    backup_number: str
+    status: str
+    validation_database_name: Optional[str] = None
+    started_by_user_id: Optional[int] = None
+    started_by_display: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    table_counts_json: Optional[Any] = None
+    validation_report_json: Optional[Any] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class OperationEntryValueCreate(BaseModel):
     field_code: str
     field_value: Optional[Any] = None

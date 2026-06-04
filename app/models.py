@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Float, Time
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, BigInteger, String, Text, UniqueConstraint, Float, Time
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -220,6 +220,167 @@ class UserRole(Base):
             name="unique_user_role",
         ),
     )
+
+
+class SystemNotification(Base):
+    __tablename__ = "system_notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_number = Column(String(80), nullable=False, unique=True, index=True)
+    title = Column(String(180), nullable=False)
+    message = Column(Text, nullable=False)
+    notification_type = Column(String(40), nullable=False, default="Info", index=True)
+    priority = Column(String(30), nullable=False, default="Normal", index=True)
+    delivery_mode = Column(String(50), nullable=False, default="Banner + Inbox")
+    target_scope = Column(String(50), nullable=False, default="All Users", index=True)
+    target_role_ids_json = Column(JSONB, nullable=True)
+    target_user_ids_json = Column(JSONB, nullable=True)
+    target_location_codes_json = Column(JSONB, nullable=True)
+    display_from = Column(DateTime, nullable=True, index=True)
+    display_until = Column(DateTime, nullable=True, index=True)
+    requires_acknowledgement = Column(String(10), nullable=False, default="No")
+    popup_enabled = Column(String(10), nullable=False, default="No")
+    banner_enabled = Column(String(10), nullable=False, default="Yes")
+    auto_dismiss_seconds = Column(Integer, nullable=True)
+    status = Column(String(30), nullable=False, default="Draft", index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    created_by_display = Column(String(150), nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    deactivated_at = Column(DateTime, nullable=True)
+    deactivated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    deactivation_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class SystemNotificationReceipt(Base):
+    __tablename__ = "system_notification_receipts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_id = Column(
+        Integer,
+        ForeignKey("system_notifications.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    username = Column(String(80), nullable=True, index=True)
+    delivered_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    first_seen_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    dismissed_at = Column(DateTime, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    acknowledgement_remarks = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default="Unread", index=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "notification_id",
+            "user_id",
+            name="unique_system_notification_receipt_user",
+        ),
+    )
+
+
+class BackupSettings(Base):
+    __tablename__ = "backup_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    enabled = Column(String(10), nullable=False, default="No")
+    schedule_mode = Column(String(30), nullable=False, default="Daily")
+    interval_value = Column(Integer, nullable=False, default=24)
+    run_time = Column(String(10), nullable=False, default="02:00")
+    retention_days = Column(Integer, nullable=False, default=30)
+    keep_minimum = Column(Integer, nullable=False, default=5)
+    backup_directory = Column(String(300), nullable=True)
+    compression_enabled = Column(String(10), nullable=False, default="Yes")
+    status = Column(String(30), nullable=False, default="Active", index=True)
+    next_run_at = Column(DateTime, nullable=True, index=True)
+    last_run_at = Column(DateTime, nullable=True)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class BackupJob(Base):
+    __tablename__ = "backup_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    backup_number = Column(String(80), nullable=False, unique=True, index=True)
+    backup_type = Column(String(40), nullable=False, default="Manual", index=True)
+    trigger_source = Column(String(40), nullable=False, default="Manual", index=True)
+    status = Column(String(40), nullable=False, default="Pending", index=True)
+    description = Column(Text, nullable=True)
+    file_name = Column(String(240), nullable=True)
+    file_path = Column(Text, nullable=True)
+    file_size_bytes = Column(BigInteger, nullable=True)
+    checksum_sha256 = Column(String(128), nullable=True)
+    database_name = Column(String(160), nullable=True)
+    backup_format = Column(String(40), nullable=False, default="custom")
+    requested_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    requested_by_display = Column(String(150), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+    metadata_json = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class BackupRestoreRequest(Base):
+    __tablename__ = "backup_restore_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_number = Column(String(80), nullable=False, unique=True, index=True)
+    backup_job_id = Column(Integer, ForeignKey("backup_jobs.id"), nullable=False, index=True)
+    backup_number = Column(String(80), nullable=False, index=True)
+    status = Column(String(40), nullable=False, default="Pending Approval", index=True)
+    reason = Column(Text, nullable=False)
+    business_impact = Column(Text, nullable=True)
+    requested_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    requested_by_display = Column(String(150), nullable=True)
+    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    approved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    approved_by_display = Column(String(150), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    rejected_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    rejected_by_display = Column(String(150), nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+    cancelled_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    cancelled_by_display = Column(String(150), nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    action_remarks = Column(Text, nullable=True)
+    metadata_json = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class BackupRestoreValidation(Base):
+    __tablename__ = "backup_restore_validations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    validation_number = Column(String(80), nullable=False, unique=True, index=True)
+    restore_request_id = Column(
+        Integer,
+        ForeignKey("backup_restore_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    backup_job_id = Column(Integer, ForeignKey("backup_jobs.id"), nullable=False, index=True)
+    backup_number = Column(String(80), nullable=False, index=True)
+    status = Column(String(40), nullable=False, default="Pending", index=True)
+    validation_database_name = Column(String(180), nullable=True)
+    started_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    started_by_display = Column(String(150), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+    table_counts_json = Column(JSONB, nullable=True)
+    validation_report_json = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 class OperationWorkflowPolicy(Base):
