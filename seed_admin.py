@@ -1,10 +1,11 @@
 import os
 import sys
-from datetime import datetime
+import secrets
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from passlib.context import CryptContext
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 load_dotenv()
@@ -132,24 +133,24 @@ def seed():
     db = Session(bind=engine)
     try:
         print("Connecting to database...")
-        db.execute(text("SELECT 1"))
-        print("Database connected.\n")
+    db.execute(text("SELECT 1"))
+    print("Database connected.\n")
 
-        # Create Admin role
-        role = db.execute(
-            text("SELECT id FROM roles WHERE role_name = 'Admin'")
-        ).fetchone()
-        if role:
-            admin_role_id = role[0]
-            print(f"[SKIP] Role 'Admin' already exists (id={admin_role_id})")
-        else:
-            result = db.execute(
-                text(
-                    "INSERT INTO roles (role_name, description, status, created_at, updated_at) "
-                    "VALUES (:name, :desc, 'Active', :now, :now) RETURNING id"
-                ),
-                {"name": "Admin", "desc": "Full system access", "now": datetime.utcnow()},
-            )
+    # Create Admin role
+    role = db.execute(
+        text("SELECT id FROM roles WHERE role_name = 'Admin'")
+    ).fetchone()
+    if role:
+        admin_role_id = role[0]
+        print(f"[SKIP] Role 'Admin' already exists (id={admin_role_id})")
+    else:
+        result = db.execute(
+            text(
+                "INSERT INTO roles (role_name, description, status, created_at, updated_at) "
+                "VALUES (:name, :desc, 'Active', :now, :now) RETURNING id"
+            ),
+            {"name": "Admin", "desc": "Full system access", "now": datetime.now(timezone.utc)},
+        )
             admin_role_id = result.fetchone()[0]
             db.commit()
             print(f"[CREATE] Role 'Admin' created (id={admin_role_id})")
@@ -180,11 +181,11 @@ def seed():
                         "pn": p["permission_name"],
                         "mn": p["module_name"],
                         "desc": p["description"],
-                        "now": datetime.utcnow(),
-                    },
-                )
-                permission_ids.append(result.fetchone()[0])
-                created_perms += 1
+                    "now": datetime.now(timezone.utc),
+                },
+            )
+            permission_ids.append(result.fetchone()[0])
+            created_perms += 1
 
         db.commit()
         print(f"[PERMISSIONS] Created {created_perms}, skipped {skipped_perms}")
@@ -207,7 +208,7 @@ def seed():
                         "INSERT INTO role_permissions (role_id, permission_id, created_at) "
                         "VALUES (:rid, :pid, :now)"
                     ),
-                    {"rid": admin_role_id, "pid": perm_id, "now": datetime.utcnow()},
+                    {"rid": admin_role_id, "pid": perm_id, "now": datetime.now(timezone.utc)},
                 )
                 assigned += 1
 
@@ -216,7 +217,7 @@ def seed():
 
         # Create admin user
         admin_username = "admin"
-        admin_password = "Admin@12345"
+        admin_password = secrets.token_urlsafe(16)
         existing_user = db.execute(
             text("SELECT id FROM users WHERE username = :un"),
             {"un": admin_username},
@@ -242,7 +243,7 @@ def seed():
                     "dept": "IT Administration",
                     "desig": "System Administrator",
                     "pw": hashed,
-                    "now": datetime.utcnow(),
+                    "now": datetime.now(timezone.utc),
                 },
             )
             admin_user_id = result.fetchone()[0]
@@ -271,14 +272,14 @@ def seed():
                         "INSERT INTO user_roles (user_id, role_id, created_at) "
                         "VALUES (:uid, :rid, :now)"
                     ),
-                    {"uid": admin_user_id, "rid": admin_role_id, "now": datetime.utcnow()},
+                    {"uid": admin_user_id, "rid": admin_role_id, "now": datetime.now(timezone.utc)},
                 )
                 db.commit()
                 print(f"[CREATE] User 'admin' assigned to 'Admin' role")
 
         print("\n=== SEED COMPLETE ===")
         print("Username: admin")
-        print("Password: Admin@12345")
+        print(f"Password: {admin_password}")
         print("Login at: http://localhost:5173")
 
     except Exception as e:
@@ -290,5 +291,4 @@ def seed():
 
 
 if __name__ == "__main__":
-    from sqlalchemy import text
     seed()

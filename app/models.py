@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, BigInteger, String, Text, UniqueConstraint, Float, Time
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
-from datetime import datetime
+from datetime import datetime, timezone
 from app.database import Base
 
 
@@ -113,7 +113,7 @@ class OperationTransactionStatusHistory(Base):
     changed_by = Column(String(100), nullable=True)
     remarks = Column(Text, nullable=True)
 
-    changed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    changed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
@@ -265,7 +265,7 @@ class SystemNotificationReceipt(Base):
     )
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     username = Column(String(80), nullable=True, index=True)
-    delivered_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    delivered_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     first_seen_at = Column(DateTime, nullable=True)
     last_seen_at = Column(DateTime, nullable=True)
     dismissed_at = Column(DateTime, nullable=True)
@@ -341,7 +341,7 @@ class BackupRestoreRequest(Base):
     business_impact = Column(Text, nullable=True)
     requested_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     requested_by_display = Column(String(150), nullable=True)
-    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    requested_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     approved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     approved_by_display = Column(String(150), nullable=True)
     approved_at = Column(DateTime, nullable=True)
@@ -843,11 +843,11 @@ class LocationOperationAvailability(Base):
     status = Column(String(50), default="Active", nullable=False)
     remarks = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
 
@@ -1018,7 +1018,7 @@ class TankerReceiptAcknowledgement(Base):
     receiver_location_code = Column(String(50), nullable=True, index=True)
 
     acknowledged_by = Column(String(150), nullable=True)
-    acknowledged_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    acknowledged_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
     remarks = Column(Text, nullable=True)
     status = Column(String(30), nullable=False, default="Acknowledged")
@@ -1091,7 +1091,7 @@ class ApprovedTransactionCorrectionRequest(Base):
     status = Column(String(50), nullable=False, default="Pending Admin Review", index=True)
     requested_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     requested_by_display = Column(String(150), nullable=True)
-    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    requested_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     admin_action = Column(String(80), nullable=True)
     admin_remarks = Column(Text, nullable=True)
     admin_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)

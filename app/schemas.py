@@ -1,10 +1,58 @@
 from datetime import date, datetime, time
 from typing import Any, Optional
-from datetime import date, datetime
-from typing import Optional, Any
-from pydantic import BaseModel, ConfigDict
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
+
+# ---------------------------------------------------------------------------
+# Auth schemas
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TwoFAVerifyRequest(BaseModel):
+    challenge_id: str
+    code: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=12)
+    confirm_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    username: str
+    reason: str | None = None
+    reset_2fa: bool = False
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=12)
+    force_password_change: bool = True
+    reset_2fa: bool = False
+    remarks: str | None = None
+
+
+class TwoFASetupVerifyRequest(BaseModel):
+    code: str
+
+
+class TwoFADisableRequest(BaseModel):
+    current_password: str
+    code: str
+
+
+class DevResetPasswordRequest(BaseModel):
+    username: str
+    new_password: str = Field(min_length=12)
+
+
+# ---------------------------------------------------------------------------
+# User schemas
+# ---------------------------------------------------------------------------
 
 class UserBase(BaseModel):
     full_name: str
@@ -1652,9 +1700,9 @@ class SystemNotificationBase(BaseModel):
     target_location_codes: Optional[list[str]] = None
     display_from: Optional[datetime] = None
     display_until: Optional[datetime] = None
-    requires_acknowledgement: bool = False
-    popup_enabled: bool = False
-    banner_enabled: bool = True
+    requires_acknowledgement: str = "No"
+    popup_enabled: str = "No"
+    banner_enabled: str = "Yes"
     auto_dismiss_seconds: Optional[int] = None
 
 
@@ -1684,9 +1732,9 @@ class SystemNotificationResponse(BaseModel):
     target_location_codes: Optional[list[str]] = None
     display_from: Optional[datetime] = None
     display_until: Optional[datetime] = None
-    requires_acknowledgement: bool
-    popup_enabled: bool
-    banner_enabled: bool
+    requires_acknowledgement: str
+    popup_enabled: str
+    banner_enabled: str
     auto_dismiss_seconds: Optional[int] = None
     status: str
     created_by_user_id: Optional[int] = None
@@ -1727,26 +1775,26 @@ class SystemNotificationReceiptResponse(BaseModel):
 
 
 class BackupSettingsUpdate(BaseModel):
-    enabled: bool = False
+    enabled: str = "No"
     schedule_mode: str = "Daily"
     interval_value: int = 24
     run_time: str = "02:00"
     retention_days: int = 30
     keep_minimum: int = 5
     backup_directory: Optional[str] = None
-    compression_enabled: bool = True
+    compression_enabled: str = "Yes"
 
 
 class BackupSettingsResponse(BaseModel):
     id: int
-    enabled: bool
+    enabled: str
     schedule_mode: str
     interval_value: int
     run_time: str
     retention_days: int
     keep_minimum: int
     backup_directory: Optional[str] = None
-    compression_enabled: bool
+    compression_enabled: str
     status: str
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
