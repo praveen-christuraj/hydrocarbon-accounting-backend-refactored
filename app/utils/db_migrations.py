@@ -1,12 +1,14 @@
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
-from app.database import engine
+from app.database import engine, SessionLocal
 from app.models import (
     OperationType,
     OperationTemplate,
     OperationTemplateField,
+    Permission,
 )
+from app.utils.default_permissions import STANDARD_PERMISSIONS
 
 
 def ensure_user_security_columns():
@@ -590,6 +592,127 @@ def ensure_operation_task_tables():
                 """
             )
         )
+
+
+def ensure_operation_template_layout_columns():
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS operation_template_layouts (
+                    id SERIAL PRIMARY KEY,
+                    template_id INTEGER NOT NULL REFERENCES operation_templates(id) ON DELETE CASCADE,
+                    layout_name VARCHAR(150) NOT NULL,
+                    version_no INTEGER NOT NULL DEFAULT 1,
+                    status VARCHAR(20) NOT NULL DEFAULT 'Draft',
+                    is_default VARCHAR(10) NOT NULL DEFAULT 'No',
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    CONSTRAINT unique_operation_template_layout_version
+                        UNIQUE (template_id, layout_name, version_no)
+                );
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS operation_template_layout_sections (
+                    id SERIAL PRIMARY KEY,
+                    layout_id INTEGER NOT NULL REFERENCES operation_template_layouts(id) ON DELETE CASCADE,
+                    section_key VARCHAR(120) NOT NULL,
+                    title VARCHAR(150) NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 1,
+                    collapsible VARCHAR(10) NOT NULL DEFAULT 'No',
+                    default_open VARCHAR(10) NOT NULL DEFAULT 'Yes',
+                    visibility_rule_json JSONB,
+                    CONSTRAINT unique_operation_template_layout_section_key
+                        UNIQUE (layout_id, section_key)
+                );
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS operation_template_layout_items (
+                    id SERIAL PRIMARY KEY,
+                    layout_id INTEGER NOT NULL REFERENCES operation_template_layouts(id) ON DELETE CASCADE,
+                    section_id INTEGER NOT NULL REFERENCES operation_template_layout_sections(id) ON DELETE CASCADE,
+                    field_id INTEGER NOT NULL REFERENCES operation_template_fields(id) ON DELETE CASCADE,
+                    row_no INTEGER NOT NULL DEFAULT 1,
+                    col_start INTEGER NOT NULL DEFAULT 1,
+                    col_span INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 1,
+                    label_override VARCHAR(150),
+                    placeholder_override VARCHAR(150),
+                    read_only_override VARCHAR(10),
+                    width_mode VARCHAR(30),
+                    rule_json JSONB,
+                    CONSTRAINT unique_operation_template_layout_field_placement
+                        UNIQUE (layout_id, field_id)
+                );
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE INDEX IF NOT EXISTS ix_operation_template_layouts_template_id
+                ON operation_template_layouts(template_id);
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE INDEX IF NOT EXISTS ix_operation_template_layout_sections_layout_id
+                ON operation_template_layout_sections(layout_id);
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE INDEX IF NOT EXISTS ix_operation_template_layout_items_layout_id
+                ON operation_template_layout_items(layout_id);
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE INDEX IF NOT EXISTS ix_operation_template_layout_items_section_id
+                ON operation_template_layout_items(section_id);
+            """)
+        )
+        connection.execute(
+            text("""
+                CREATE INDEX IF NOT EXISTS ix_operation_template_layout_items_field_id
+                ON operation_template_layout_items(field_id);
+            """)
+        )
+
+
+def seed_default_permissions():
+    db = SessionLocal()
+    try:
+        created_count = 0
+        existing_count = 0
+        for permission_data in STANDARD_PERMISSIONS:
+            existing = (
+                db.query(Permission)
+                .filter(
+                    Permission.permission_name.ilike(permission_data["permission_name"]),
+                    Permission.module_name.ilike(permission_data["module_name"]),
+                )
+                .first()
+            )
+            if existing:
+                existing_count += 1
+                continue
+            db.add(Permission(
+                permission_name=permission_data["permission_name"],
+                module_name=permission_data["module_name"],
+                description=permission_data["description"],
+                status="Active",
+            ))
+            created_count += 1
+        db.commit()
+        if created_count:
+            print(f"Seeded {created_count} default permissions ({existing_count} already existed)")
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def migrate_boolean_columns():

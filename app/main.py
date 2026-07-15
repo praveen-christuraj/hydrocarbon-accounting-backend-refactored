@@ -48,6 +48,7 @@ from app.utils.db_migrations import (
     ensure_operation_workflow_policy_tables,
     ensure_operation_task_tables,
     migrate_boolean_columns,
+    seed_default_permissions,
 )
 
 
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
     ensure_operation_workflow_policy_tables()
     ensure_operation_task_tables()
     migrate_boolean_columns()
+    seed_default_permissions()
 
     from app.routers.backup_restore import start_backup_scheduler
     start_backup_scheduler()

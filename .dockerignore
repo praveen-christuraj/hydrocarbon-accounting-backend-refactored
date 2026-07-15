@@ -9,9 +9,6 @@ __pycache__/
 *.md
 .vscode/
 .idea/
-node_modules/
-frontend/dist/
-frontend/node_modules/
 ruvector.db
 graphify-out/
 .swarm/
