@@ -88,7 +88,8 @@ def get_role_permissions(
             detail="Role not found",
         )
 
-    return build_role_permission_response(role, db)
+    permissions_by_role = load_permissions_by_role(db, [role.id])
+    return build_role_permission_response(role, permissions_by_role)
 
 
 @router.post("/{role_id}", response_model=RolePermissionResponse)

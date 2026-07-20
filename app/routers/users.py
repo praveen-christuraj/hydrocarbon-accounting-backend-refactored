@@ -83,6 +83,7 @@ def create_user(
         designation=clean_optional_text(user.designation),
         password_hash=hash_password(user.password),
         password_changed_at=datetime.now(timezone.utc),
+        force_password_change="Yes",
         status=user.status,
     )
 

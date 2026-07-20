@@ -55,12 +55,13 @@ def build_totp_qr_data_url(provisioning_uri: str):
     return f"data:image/png;base64,{encoded}"
 
 
-def create_login_challenge(db: Session, user: User):
+def create_login_challenge(db: Session, user: User, ip_address: str | None = None):
     challenge = AuthLoginChallenge(
         challenge_id=secrets.token_urlsafe(32),
         user_id=user.id,
         status="Pending",
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        ip_address=ip_address,
     )
     db.add(challenge)
     db.flush()

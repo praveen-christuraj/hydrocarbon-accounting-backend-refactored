@@ -1,9 +1,29 @@
+import hashlib
+from datetime import datetime, timezone
+
 from fastapi import Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User
+from app.models import TokenBlacklist, User
 from app.utils.jwt import decode_access_token
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def is_token_blacklisted(token: str, db: Session) -> bool:
+    token_hash = hash_token(token)
+    return (
+        db.query(TokenBlacklist)
+        .filter(
+            TokenBlacklist.token_hash == token_hash,
+            TokenBlacklist.expires_at > datetime.now(timezone.utc),
+        )
+        .first()
+        is not None
+    )
 
 
 def get_current_user_from_token(
@@ -23,6 +43,13 @@ def get_current_user_from_token(
         )
 
     token = authorization[7:].strip()
+
+    # Check blacklist before decoding
+    if is_token_blacklisted(token, db):
+        raise HTTPException(
+            status_code=401,
+            detail="Token has been revoked. Please login again.",
+        )
 
     payload = decode_access_token(token)
 

@@ -50,6 +50,10 @@ class DevResetPasswordRequest(BaseModel):
     new_password: str = Field(min_length=12)
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
 # ---------------------------------------------------------------------------
 # User schemas
 # ---------------------------------------------------------------------------

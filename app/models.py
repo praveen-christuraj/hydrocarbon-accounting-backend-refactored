@@ -1831,3 +1831,12 @@ class FSOVoyage(Base):
             name="unique_fso_voyage_key",
         ),
     )
+
+
+class TokenBlacklist(Base):
+    __tablename__ = "token_blacklist"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token_hash = Column(String(200), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())

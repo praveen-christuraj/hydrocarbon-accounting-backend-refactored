@@ -1,9 +1,11 @@
+import hashlib
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User, AuthLoginChallenge, PasswordResetRequest, Role, UserRole, OperationTask
+from app.models import TokenBlacklist, User, AuthLoginChallenge, PasswordResetRequest, Role, UserRole, OperationTask
+from app.dependencies.auth import hash_token
 from app.schemas import (
     LoginRequest,
     TwoFAVerifyRequest,
@@ -12,6 +14,7 @@ from app.schemas import (
     AdminResetPasswordRequest,
     TwoFASetupVerifyRequest,
     TwoFADisableRequest,
+    RefreshTokenRequest,
 )
 from app.dependencies.auth import get_current_user_from_token
 from app.dependencies.permissions import require_user_permission
@@ -25,7 +28,7 @@ from app.utils.totp import (
     build_totp_qr_data_url,
     create_login_challenge,
 )
-from app.utils.jwt import create_access_token
+from app.utils.jwt import create_access_token, create_refresh_token, decode_refresh_token
 from app.utils.helpers import clean_optional_text, normalize_yes_no
 from app.utils.password_policy import validate_password_policy
 
@@ -45,8 +48,10 @@ def generate_password_reset_request_number(db: Session):
 @router.post("/login")
 def login_user(
     login_request: LoginRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    client_ip = request.client.host if request.client else None
     username = login_request.username.strip()
 
     if username == "":
@@ -121,7 +126,7 @@ def login_user(
     user.locked_until = None
 
     if normalize_yes_no(getattr(user, "totp_enabled", "No")) == "Yes":
-        challenge = create_login_challenge(db, user)
+        challenge = create_login_challenge(db, user, client_ip)
         create_audit_log(
             db=db,
             module_name="Authentication",
@@ -132,7 +137,7 @@ def login_user(
             entity_label=f"{user.full_name} ({user.username})" if user.full_name else user.username,
             remarks="Password verified; waiting for 2FA verification",
             request_path="/auth/login",
-            details={"challenge_id": challenge.challenge_id},
+            details={"challenge_id": challenge.challenge_id, "ip_address": client_ip},
         )
         db.commit()
         return {
@@ -154,8 +159,15 @@ def login_user(
             "username": user.username,
         }
     )
+    refresh_token = create_refresh_token(
+        data={
+            "user_id": user.id,
+            "username": user.username,
+        }
+    )
 
     user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_ip = client_ip
 
     create_audit_log(
         db=db,
@@ -178,6 +190,7 @@ def login_user(
         "message": "Login successful",
         "requires_2fa": False,
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": logged_in_user,
         "role": logged_in_user["role"],
@@ -188,8 +201,10 @@ def login_user(
 @router.post("/2fa/verify")
 def verify_login_2fa(
     verify_request: TwoFAVerifyRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    client_ip = request.client.host if request.client else None
     challenge = (
         db.query(AuthLoginChallenge)
         .filter(AuthLoginChallenge.challenge_id == verify_request.challenge_id)
@@ -221,12 +236,19 @@ def verify_login_2fa(
     challenge.status = "Verified"
     challenge.verified_at = datetime.now(timezone.utc)
     user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_ip = client_ip
     user.failed_login_count = 0
     user.locked_until = None
 
     from app.dependencies.permissions import build_logged_in_user_response
     logged_in_user = build_logged_in_user_response(user, db)
     access_token = create_access_token(
+        data={
+            "user_id": user.id,
+            "username": user.username,
+        }
+    )
+    refresh_token = create_refresh_token(
         data={
             "user_id": user.id,
             "username": user.username,
@@ -251,6 +273,7 @@ def verify_login_2fa(
         "message": "Login successful",
         "requires_2fa": False,
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": logged_in_user,
         "role": logged_in_user["role"],
@@ -309,11 +332,37 @@ def change_own_password(
     return {"message": "Password changed successfully"}
 
 
+# Rate-limiting: track forgot-password requests per IP in last 15 minutes
+FORGOT_PASSWORD_WINDOW = timedelta(minutes=15)
+FORGOT_PASSWORD_MAX_PER_WINDOW = 3
+
+
+def _check_forgot_password_rate_limit(request: Request, db: Session):
+    client_ip = request.client.host if request.client else "unknown"
+    cutoff = datetime.now(timezone.utc) - FORGOT_PASSWORD_WINDOW
+    recent_count = (
+        db.query(PasswordResetRequest)
+        .filter(
+            PasswordResetRequest.requested_by_ip == client_ip,
+            PasswordResetRequest.requested_at >= cutoff,
+        )
+        .count()
+    )
+    if recent_count >= FORGOT_PASSWORD_MAX_PER_WINDOW:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many password reset requests. Please try again later.",
+        )
+    return client_ip
+
+
 @router.post("/forgot-password")
-def request_password_reset(
+def request_password_reset_with_rate_limit(
     payload: ForgotPasswordRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    client_ip = _check_forgot_password_rate_limit(request, db)
     username = str(payload.username or "").strip()
     if username == "":
         raise HTTPException(status_code=400, detail="Username is required")
@@ -340,6 +389,7 @@ def request_password_reset(
         status="Pending",
         reason=clean_optional_text(payload.reason),
         reset_2fa="Yes" if payload.reset_2fa else "No",
+        requested_by_ip=client_ip,
     )
     db.add(reset_request)
     db.flush()
@@ -383,10 +433,90 @@ def request_password_reset(
         entity_label=reset_request.request_number,
         remarks="Password reset requested",
         request_path="/auth/forgot-password",
-        details={"username": user.username, "reset_2fa": reset_request.reset_2fa, "task_id": task.id},
+        details={"username": user.username, "reset_2fa": reset_request.reset_2fa, "task_id": task.id, "ip_address": client_ip},
     )
     db.commit()
     return {"message": "If the account exists, a reset request has been submitted"}
+
+
+@router.post("/logout")
+def logout_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        # No valid token to revoke — still a successful logout client-side
+        return {"message": "Logged out successfully"}
+
+    token = authorization[7:].strip()
+    try:
+        from app.utils.jwt import decode_access_token
+        payload = decode_access_token(token)
+        expires_at = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+
+        blacklisted = TokenBlacklist(
+            token_hash=hash_token(token),
+            expires_at=expires_at,
+        )
+        db.add(blacklisted)
+        db.commit()
+    except Exception:
+        # Best-effort: don't fail logout if blacklist write fails
+        db.rollback()
+
+    return {"message": "Logged out successfully"}
+
+
+# --- Cleanup old blacklisted tokens (runs once a day via a lightweight sweep) ---
+@router.post("/cleanup-blacklist")
+def cleanup_token_blacklist(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    require_user_permission(current_user, "Manage System Settings", db)
+    deleted = (
+        db.query(TokenBlacklist)
+        .filter(TokenBlacklist.expires_at <= datetime.now(timezone.utc))
+        .delete()
+    )
+    db.commit()
+    return {"message": f"Cleaned up {deleted} expired token blacklist entries"}
+
+
+@router.post("/refresh")
+def refresh_access_token(
+    payload: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    refresh_token_str = payload.refresh_token
+    if not refresh_token_str:
+        raise HTTPException(status_code=400, detail="Refresh token is required")
+
+    # Check blacklist
+    from app.dependencies.auth import is_token_blacklisted
+    if is_token_blacklisted(refresh_token_str, db):
+        raise HTTPException(status_code=401, detail="Refresh token has been revoked")
+
+    decoded = decode_refresh_token(refresh_token_str)
+    user_id = decoded.get("user_id")
+    username = decoded.get("username")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.status != "Active":
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    new_access_token = create_access_token(
+        data={"user_id": user.id, "username": user.username},
+    )
+    new_refresh_token = create_refresh_token(
+        data={"user_id": user.id, "username": user.username},
+    )
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer",
+    }
 
 
 @router.post("/2fa/setup/start")
